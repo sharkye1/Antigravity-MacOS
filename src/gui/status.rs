@@ -218,7 +218,9 @@ impl Facts {
             relay_outdated: s.relay_outdated,
             // Rules are only owed while the DNS switch is on: a route running alone
             // (own proxy, group, exits) has none by design.
-            rules: s.rules || !s.dns.is_on() || !cfg!(target_os = "windows"),
+            rules: s.rules
+                || !s.dns.is_on()
+                || !cfg!(any(target_os = "windows", target_os = "macos")),
             relay_reporting: relay.is_some(),
             refusal,
             answer,
@@ -231,7 +233,10 @@ impl Facts {
             net_ok: gate.net_ok,
             relay_exe: relay.map(|r| r.exe.clone()).unwrap_or_default(),
             verify: gate.verify.as_ref().map(|v| (aged(v.ago), v.url.clone())),
-            overloaded: gate.overloaded.as_ref().map(|o| (aged(o.ago), o.model.clone())),
+            overloaded: gate
+                .overloaded
+                .as_ref()
+                .map(|o| (aged(o.ago), o.model.clone())),
             unauthorized: gate.unauthorized.map(|u| (aged(u.ago), u.count)),
         }
     }
@@ -477,9 +482,7 @@ pub fn headline(f: &Facts) -> Headline {
     }
     // A refusal newer than the 503 is the news; the 503 was an earlier turn.
     let overloaded = f.overloaded.as_ref().filter(|(ago, _)| {
-        *ago <= crate::gate::RECENT
-            && unanswered(*ago)
-            && f.refusal.is_none_or(|(r, _)| r > *ago)
+        *ago <= crate::gate::RECENT && unanswered(*ago) && f.refusal.is_none_or(|(r, _)| r > *ago)
     });
     if let Some((ago, model)) = overloaded {
         let which = if model.is_empty() {

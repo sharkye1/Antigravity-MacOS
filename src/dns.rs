@@ -121,7 +121,7 @@ pub fn flush_client_cache() -> bool {
 
 /// No NRPT and no DNS Client here: there are no rules of ours in front of a
 /// resolver cache to invalidate.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn flush_client_cache() -> bool {
     false
 }
@@ -225,7 +225,7 @@ fn restore_ipv4_precedence() {
 
 /// Linux has no NRPT and no relay installed yet, so there is nothing to remove;
 /// the undo menus must not spawn doomed helpers or error here.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn remove_dns_nrpt() {}
 
 #[cfg(target_os = "windows")]
@@ -244,6 +244,16 @@ pub fn remove_dns_nrpt() {
     );
     powershell(&cmd);
     invalidate_cache();
+}
+
+pub fn remove_dns_checked() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return crate::macos::configure_dns(false);
+    #[cfg(not(target_os = "macos"))]
+    {
+        remove_dns_nrpt();
+        Ok(())
+    }
 }
 
 /// Namespaces currently installed under our tag, lowercased.
@@ -266,7 +276,7 @@ fn installed_namespaces() -> Vec<String> {
 /// No NRPT layer on Linux yet, so no rules are ever applied. Returning false
 /// keeps the "running without admin" advisory honest and stops `main()` probing
 /// PowerShell that is not there.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn is_nrpt_applied() -> bool {
     false
 }
@@ -509,9 +519,45 @@ const HELPER_LIMIT: Duration = Duration::from_secs(15);
 /// lands, the binary/JS patch is what lifts the gate on a permitted exit, and
 /// this reports "not done" so the caller can say so rather than half-running the
 /// Windows path.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
     Err("DNS-слой на Linux пока не портирован".to_string())
+}
+
+#[cfg(target_os = "macos")]
+pub fn flush_client_cache() -> bool {
+    bounded_output(
+        Command::new("/usr/bin/dscacheutil").arg("-flushcache"),
+        HELPER_LIMIT,
+    )
+    .is_some_and(|o| o.status.success())
+}
+
+#[cfg(target_os = "macos")]
+pub fn is_nrpt_applied() -> bool {
+    crate::macos::dns_enabled()
+}
+
+#[cfg(target_os = "macos")]
+pub fn remove_dns_nrpt() {
+    if let Err(e) = crate::macos::configure_dns(false) {
+        dns_forwarder::log_fatal(&format!("DNS не снят: {e}"));
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
+    crate::macos::configure_dns(true)?;
+    Ok(DnsOutcome {
+        vpn_active: egress::detect().is_some_and(|e| e.vpn_active),
+        stood_down_for_vpn: false,
+        client: egress::ClientEgress::Unknown,
+        via_relay: true,
+        pinned: Vec::new(),
+        pin_error: None,
+        taken_over: Vec::new(),
+        probe_gave_up: false,
+    })
 }
 
 #[cfg(target_os = "windows")]

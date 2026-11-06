@@ -61,10 +61,18 @@ mod sys {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod sys {
     pub fn bind_socket_to_interface(_: &std::net::UdpSocket, _: u32) -> Result<(), String> {
         Err("поддерживается только на Windows".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod sys {
+    pub fn bind_socket_to_interface(sock: &std::net::UdpSocket, index: u32) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        crate::macos::bind_interface(sock.as_raw_fd(), false, index).map_err(|e| e.to_string())
     }
 }
 

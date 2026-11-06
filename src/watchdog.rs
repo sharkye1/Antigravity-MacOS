@@ -200,7 +200,9 @@ fn updater_dirs() -> Vec<PathBuf> {
 /// the fast poll on for as long as it waits - days, if the user never quits.
 fn updater_busy(dirs: &[PathBuf]) -> bool {
     dirs.iter().any(|d| {
-        let Ok(rd) = fs::read_dir(d) else { return false };
+        let Ok(rd) = fs::read_dir(d) else {
+            return false;
+        };
         rd.flatten()
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == "exe"))
@@ -394,8 +396,7 @@ fn repatch(target: &Path) -> RepatchOutcome {
 /// touched; only the IDE's `out/main.js` is.
 fn targets(inst: &Path) -> Vec<PathBuf> {
     let mut list = patch_binary::binary_targets(inst);
-    let ide_js = inst
-        .join("resources")
+    let ide_js = crate::resources_dir(inst)
         .join("app")
         .join("out")
         .join("main.js");

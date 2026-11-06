@@ -206,7 +206,7 @@ pub fn message_box(title: &str, text: &str) {
 /// run from a shell); the dialog is the copy the desktop user can see. Best
 /// effort by design: none of these three is guaranteed to be installed, and a
 /// missing one must not turn a diagnostic into a second failure.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn message_box(title: &str, text: &str) {
     eprintln!("{}: {}", title, text);
     let tried = [
@@ -228,6 +228,25 @@ pub fn message_box(title: &str, text: &str) {
             return;
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn message_box(title: &str, text: &str) {
+    eprintln!("{title}: {text}");
+    // Both strings are argv, never interpolated into AppleScript source.
+    let _ = Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            "on run argv",
+            "-e",
+            "display alert (item 1 of argv) message (item 2 of argv) as critical",
+            "-e",
+            "end run",
+            "--",
+            title,
+            text,
+        ])
+        .status();
 }
 
 // Open a URL in the system default browser (Windows: cmd /c start "" <url>).
@@ -266,9 +285,13 @@ pub fn open_url(url: &str) {
             );
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Command::new("xdg-open").arg(url).status().ok();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("/usr/bin/open").arg(url).spawn().ok();
     }
 }
 
@@ -449,6 +472,14 @@ pub fn save_text_file(dir: &Path, name: &str, text: &str) -> Option<PathBuf> {
 /// has it under the cursor rather than a path to go and find. Best effort: a
 /// machine with no shell at all simply gets nothing.
 pub fn reveal_in_explorer(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .ok();
+    }
     #[cfg(target_os = "windows")]
     {
         // `/select,"<path>"` verbatim. `arg()` quotes the whole thing once the
@@ -460,7 +491,7 @@ pub fn reveal_in_explorer(path: &Path) {
         cmd.raw_arg(format!("/select,\"{}\"", path.display()));
         no_window(&mut cmd).spawn().ok();
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         if let Some(dir) = path.parent() {
             Command::new("xdg-open")

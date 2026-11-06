@@ -207,7 +207,7 @@ fn parse_smbios(mut data: &[u8]) -> Option<String> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn get_raw_hwid() -> String {
     use std::fs;
     if let Ok(uuid) = fs::read_to_string("/sys/class/dmi/id/product_uuid") {
@@ -223,6 +223,30 @@ fn get_raw_hwid() -> String {
         }
     }
     "unknown".to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn get_raw_hwid() -> String {
+    let out = crate::utils::bounded_output(
+        std::process::Command::new("/usr/sbin/ioreg").args([
+            "-rd1",
+            "-c",
+            "IOPlatformExpertDevice",
+        ]),
+        std::time::Duration::from_secs(10),
+    );
+    if let Some(out) = out.filter(|o| o.status.success()) {
+        if let Some(uuid) = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("\"IOPlatformUUID\""))
+            .and_then(|l| l.split_once('='))
+            .map(|(_, value)| value.trim().trim_matches('"').to_lowercase())
+            .filter(|v| !v.is_empty())
+        {
+            return format!("platform-uuid:{uuid}");
+        }
+    }
+    "unknown".into()
 }
 
 #[cfg(test)]

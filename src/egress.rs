@@ -71,6 +71,7 @@ fn parse_egress(line: &str) -> Option<Egress> {
 /// drops WireGuard/TAP tunnels and the Hyper-V/VMware virtual switches in one
 /// go, and requiring a real next hop drops host-only adapters, which carry a
 /// gateway address but no default route.
+#[cfg(not(target_os = "macos"))]
 pub fn detect() -> Option<Egress> {
     const SCRIPT: &str = "\
 $phys=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | \
@@ -90,6 +91,36 @@ if ($mine.Count -eq 0) { 'none' } else { \
         .rev()
         .find(|l| !l.trim().is_empty())
         .and_then(parse_egress)
+}
+
+#[cfg(target_os = "macos")]
+pub fn detect() -> Option<Egress> {
+    use std::process::Command;
+    let out = crate::utils::bounded_output(
+        Command::new("/usr/sbin/netstat").args(["-rn", "-f", "inet"]),
+        Duration::from_secs(5),
+    )?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let physical = text.lines().find_map(|line| {
+        let cols: Vec<_> = line.split_whitespace().collect();
+        if cols.first().copied() != Some("default") {
+            return None;
+        }
+        cols.iter()
+            .find(|s| s.starts_with("en") && s[2..].bytes().all(|b| b.is_ascii_digit()))
+            .map(|s| s.to_string())
+    })?;
+    let routed = crate::macos::route_interface("1.1.1.1");
+    let vpn_active = routed
+        .as_deref()
+        .is_some_and(|n| n.starts_with("utun") || n.starts_with("ppp") || n.starts_with("ipsec"));
+    Some(Egress {
+        if_index: crate::macos::interface_index(&physical)?,
+        vpn_active,
+    })
 }
 
 // Which way the *client* leaves, which is not the question `vpn_active` answers.

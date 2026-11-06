@@ -1055,7 +1055,8 @@ fn probe_dns() -> (bool, bool) {
 /// Windows only. The Linux proxy writes that file solely to record a blocker,
 /// so there the systemd unit being active is all there is to go on.
 fn relay_reporting() -> bool {
-    !cfg!(target_os = "windows") || crate::gate::read().is_some_and(|r| !r.is_stale())
+    !cfg!(any(target_os = "windows", target_os = "macos"))
+        || crate::gate::read().is_some_and(|r| !r.is_stale())
 }
 
 fn dns_state(
@@ -1867,7 +1868,11 @@ fn disable_dns(ctx: &mut Ctx) {
     }
 
     // I45: both steps run regardless of what the first one did.
-    dns::remove_dns_nrpt();
+    if let Err(e) = dns::remove_dns_checked() {
+        ctx.log(Level::Err, format!("Правила DNS не сняты: {e}"));
+        // Keep the listener alive while /etc/resolver still points at it.
+        return;
+    }
     dns::invalidate_cache();
     ctx.log(Level::Ok, "Правила DNS сняты.");
     if keep_relay {

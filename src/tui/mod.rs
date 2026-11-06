@@ -53,9 +53,13 @@ pub fn requested() -> bool {
 #[cfg(not(windows))]
 pub fn only_terminal() -> bool {
     use std::io::IsTerminal;
-    std::env::var_os("DISPLAY").is_none()
+    let headless = std::env::var_os("DISPLAY").is_none()
         && std::env::var_os("WAYLAND_DISPLAY").is_none()
-        && std::io::stdin().is_terminal()
+        && std::io::stdin().is_terminal();
+    #[cfg(target_os = "macos")]
+    return headless && std::env::var_os("SSH_CONNECTION").is_some();
+    #[cfg(not(target_os = "macos"))]
+    headless
 }
 
 /// Runs until the user quits. `note` is shown first in the journal — why the
@@ -323,10 +327,11 @@ impl App {
         if self.screen == Screen::License {
             self.key = text.to_string();
             self.key_error = false;
-        } else if let Some(Input::Path { text: t, .. }
+        } else if let Some(
+            Input::Path { text: t, .. }
             | Input::OwnProxy { text: t }
-            | Input::CustomDns { text: t }) =
-            &mut self.input
+            | Input::CustomDns { text: t },
+        ) = &mut self.input
         {
             t.push_str(text);
         }
@@ -364,7 +369,8 @@ impl App {
             return;
         }
         if auth::verify_key(self.key.trim()) {
-            self.worker.send(Cmd::RememberLicense(self.key.trim().to_string()));
+            self.worker
+                .send(Cmd::RememberLicense(self.key.trim().to_string()));
             self.screen = Screen::Main;
             self.worker.send(Cmd::Unlocked);
         } else {
@@ -557,7 +563,10 @@ impl App {
             Row::GroupProxyCopy => {
                 let cmd = format!("/ag+{}", crate::hwid::pc_code());
                 crate::utils::set_clipboard_text(&cmd);
-                self.toast(format!("Скопировано: {} — отправьте это сообщение в комнате", cmd));
+                self.toast(format!(
+                    "Скопировано: {} — отправьте это сообщение в комнате",
+                    cmd
+                ));
             }
             Row::GroupProxyPaste => {
                 if let Some(text) = crate::utils::clipboard_text() {
@@ -610,7 +619,9 @@ impl App {
             Action::Verify => {
                 if let Some((_, url)) = self.facts().and_then(|f| f.verify) {
                     crate::utils::open_url_as_user(&url);
-                    self.toast(format!("Если браузер не открылся, откройте ссылку вручную: {url}"));
+                    self.toast(format!(
+                        "Если браузер не открылся, откройте ссылку вручную: {url}"
+                    ));
                 }
             }
         }
@@ -864,12 +875,24 @@ impl App {
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw("      Код ПК: "),
-                    Span::styled(format!("{} - {}", pc, key_text), Style::new().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{} - {}", pc, key_text),
+                        Style::new().fg(Color::Gray),
+                    ),
                 ]))
             }
-            Row::GroupProxyOpenRoom => ListItem::new(Line::from(vec![Span::styled("      > Открыть комнату группы", Style::new().fg(Color::Cyan))])),
-            Row::GroupProxyCopy => ListItem::new(Line::from(vec![Span::styled("      > Скопировать команду", Style::new().fg(Color::Cyan))])),
-            Row::GroupProxyPaste => ListItem::new(Line::from(vec![Span::styled("      > Вставить ключ из буфера", Style::new().fg(Color::Cyan))])),
+            Row::GroupProxyOpenRoom => ListItem::new(Line::from(vec![Span::styled(
+                "      > Открыть комнату группы",
+                Style::new().fg(Color::Cyan),
+            )])),
+            Row::GroupProxyCopy => ListItem::new(Line::from(vec![Span::styled(
+                "      > Скопировать команду",
+                Style::new().fg(Color::Cyan),
+            )])),
+            Row::GroupProxyPaste => ListItem::new(Line::from(vec![Span::styled(
+                "      > Вставить ключ из буфера",
+                Style::new().fg(Color::Cyan),
+            )])),
             Row::CustomDnsText => {
                 let text = self.custom_dns_text();
                 let shown = if text.is_empty() {

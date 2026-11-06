@@ -173,8 +173,17 @@ fn write_atomic(bin_path: &Path, data: &[u8]) -> std::io::Result<()> {
             .unwrap_or(0o755);
         let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode));
     }
+    #[cfg(target_os = "macos")]
+    if let Err(e) = crate::macos::sign_native(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     match fs::rename(&tmp, bin_path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(target_os = "macos")]
+            crate::macos::sign_enclosing_bundle(bin_path).map_err(std::io::Error::other)?;
+            Ok(())
+        }
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             Err(e)
@@ -371,9 +380,8 @@ pub fn repatch_if_needed(bin_path: &Path) -> RepatchOutcome {
 /// `language_server*` file - whatever the exact suffix, the signature scan then
 /// decides whether it is really a target.
 pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
-    let resources_bin = inst.join("resources").join("bin");
-    let ext_bin = inst
-        .join("resources")
+    let resources_bin = crate::resources_dir(inst).join("bin");
+    let ext_bin = crate::resources_dir(inst)
         .join("app")
         .join("extensions")
         .join("antigravity")
@@ -414,8 +422,7 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
     // IDE 2.6.0 carries no language server of its own: its `agy` extension
     // downloads the backend into the user's `~/.gemini/bin`. That file is the
     // IDE's, so the IDE's row reads and patches it (G85).
-    if inst
-        .join("resources")
+    if crate::resources_dir(inst)
         .join("app")
         .join("extensions")
         .join("agy")

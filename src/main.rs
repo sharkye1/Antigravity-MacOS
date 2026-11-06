@@ -29,14 +29,17 @@ mod egress;
 mod elevate;
 mod endpoint;
 mod gate;
+pub mod group;
+mod group_key;
 mod gui;
 mod health;
 mod hosts_pin;
 mod hwid;
 mod instances;
-mod group_key;
 mod loopback;
 mod ls_log;
+#[cfg(any(target_os = "macos", test))]
+mod macos;
 mod net;
 mod ops;
 mod patch_binary;
@@ -49,7 +52,6 @@ mod settings;
 mod tui;
 mod update;
 mod upstream;
-pub mod group;
 mod utils;
 mod watchdog;
 
@@ -69,6 +71,17 @@ pub fn clean_input_path(input: &str) -> String {
     s.to_string()
 }
 
+/// macOS bundles use a capital R, including on case-sensitive APFS volumes.
+pub fn resources_dir(install: &Path) -> PathBuf {
+    if install.extension().is_some_and(|e| e == "app") {
+        return install.join("Contents/Resources");
+    }
+    if install.file_name().is_some_and(|n| n == "Contents") {
+        return install.join("Resources");
+    }
+    install.join("resources")
+}
+
 fn is_install_root(path: &Path) -> bool {
     if !path.exists() || !path.is_dir() {
         return false;
@@ -83,7 +96,7 @@ fn is_install_root(path: &Path) -> bool {
         return false;
     }
 
-    let resources = path.join("resources");
+    let resources = resources_dir(path);
     if resources.exists() && resources.is_dir() {
         if resources.join("app.asar").exists()
             || resources.join("app").exists()
@@ -136,7 +149,7 @@ pub fn resolve_install_root(raw: &Path) -> Option<PathBuf> {
     }
 
     let mut current = p.clone();
-    for _ in 0..4 {
+    for _ in 0..8 {
         if let Some(parent) = current.parent() {
             if is_install_root(parent) {
                 return Some(parent.to_path_buf());
@@ -204,7 +217,7 @@ fn standard_install_candidates() -> Vec<PathBuf> {
 /// `resources/app/extensions/antigravity/bin/`. The CLI keeps a per-user `agy`
 /// tree. Anything not covered here is reachable through menu 2 (manual path),
 /// which is why this list can stay short rather than scanning the whole disk.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn standard_install_candidates() -> Vec<PathBuf> {
     let home = env::var("HOME").unwrap_or_default();
     let mut v: Vec<PathBuf> = Vec::new();
@@ -236,6 +249,27 @@ fn standard_install_candidates() -> Vec<PathBuf> {
         v.push(h.join(".gemini/bin"));
     }
     v
+}
+
+#[cfg(target_os = "macos")]
+fn standard_install_candidates() -> Vec<PathBuf> {
+    let home = PathBuf::from(env::var_os("HOME").unwrap_or_default());
+    let mut paths = Vec::new();
+    for base in [PathBuf::from("/Applications"), home.join("Applications")] {
+        for name in ["Antigravity.app", "Antigravity IDE.app"] {
+            paths.push(base.join(name));
+        }
+    }
+    for dir in [
+        ".local/bin",
+        ".agy/bin",
+        ".agy",
+        ".local/share/agy/bin",
+        ".gemini/bin",
+    ] {
+        paths.push(home.join(dir));
+    }
+    paths
 }
 
 /// The directory holding the `agy` CLI, found via PATH first and then the common
@@ -281,6 +315,8 @@ fn scan_antigravity_dirs() -> Vec<PathBuf> {
         "/usr/local/share".to_string(),
         format!("{}/.local/share", home),
     ];
+    #[cfg(target_os = "macos")]
+    let bases = ["/Applications".to_string(), format!("{home}/Applications")];
     for base in bases {
         if let Ok(entries) = fs::read_dir(&base) {
             for e in entries.flatten() {
@@ -402,11 +438,18 @@ pub struct InstallOutcome {
 }
 
 pub fn process_install(install: &Path) -> Result<InstallOutcome, String> {
+    let outcome = process_install_files(install)?;
+    #[cfg(target_os = "macos")]
+    macos::sign_enclosing_bundle(install)?;
+    Ok(outcome)
+}
+
+fn process_install_files(install: &Path) -> Result<InstallOutcome, String> {
     // Patch all relevant binaries (Language Server / CLI).
     let bin_summary = patch_all_binaries(install);
     let mut warnings: Vec<String> = Vec::new();
 
-    let resources = install.join("resources");
+    let resources = crate::resources_dir(install);
     let app_dir = resources.join("app");
     let app_asar = resources.join("app.asar");
 
@@ -545,7 +588,10 @@ pub fn install_label(install: &Path) -> &'static str {
     if install.join("agy.exe").is_file() || install.join("agy").is_file() {
         "Antigravity CLI"
     } else if install.join("Antigravity IDE.exe").exists()
-        || install.join("resources").join("app").join("out").exists()
+        || crate::resources_dir(install)
+            .join("app")
+            .join("out")
+            .exists()
     {
         "Antigravity IDE"
     } else {
@@ -554,6 +600,19 @@ pub fn install_label(install: &Path) -> &'static str {
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    {
+        let args: Vec<String> = env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == macos::DNS_FLAG) {
+            match macos::dns_helper(args.get(i + 1).map(String::as_str).unwrap_or("")) {
+                Ok(()) => return,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     if env::args().skip(1).any(|a| {
         matches!(
             a.trim_start_matches('-').to_ascii_lowercase().as_str(),
@@ -648,6 +707,33 @@ fn run_tui(note: Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_bundle_resources_preserve_case_and_find_the_language_server() {
+        let base = env::temp_dir().join(format!("ag_macos_layout_{}", std::process::id()));
+        let bundle = base.join("Antigravity IDE.app");
+        let resources = bundle.join("Contents/Resources");
+        let bin = resources.join("app/extensions/antigravity/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let server = bin.join("language_server_darwin_arm64");
+        fs::write(&server, b"fixture").unwrap();
+        assert_eq!(resources_dir(&bundle), resources);
+        assert_eq!(resources_dir(&bundle.join("Contents")), resources);
+        assert_eq!(resolve_install_root(&bundle), Some(bundle.clone()));
+        assert_eq!(resolve_install_root(&server), Some(bundle.join("Contents")));
+        assert!(patch_binary::binary_targets(&bundle)
+            .iter()
+            .any(|p| p.file_name() == server.file_name()));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn ordinary_installs_keep_the_lowercase_resources_directory() {
+        assert_eq!(
+            resources_dir(Path::new("install")),
+            Path::new("install/resources")
+        );
+    }
 
     /// Regression: `%LOCALAPPDATA%` holds an `agy` *directory* (the CLI's folder).
     /// An `exists()` check matched that directory, so the parent-walk in

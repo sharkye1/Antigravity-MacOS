@@ -26,7 +26,12 @@ fn is_service_args(args: &[String]) -> bool {
     args.iter().any(|a| {
         matches!(
             a.as_str(),
-            "--dns-forwarder" | "--watchdog" | "--proxy" | "--patch-root" | "--unpatch-root"
+            "--dns-forwarder"
+                | "--watchdog"
+                | "--proxy"
+                | "--patch-root"
+                | "--unpatch-root"
+                | "--macos-dns"
         )
     })
 }
@@ -75,7 +80,7 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod platform {
     use super::{is_service_args, is_window_name};
 
@@ -121,6 +126,60 @@ mod platform {
                 .arg("-TERM")
                 .arg(pid.to_string())
                 .output();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::{is_service_args, is_window_name};
+    use std::process::Command;
+    use std::time::Duration;
+    pub fn close_others(own: &str) {
+        let Ok(uid) = Command::new("/usr/bin/id").arg("-u").output() else {
+            return;
+        };
+        let Some(out) = crate::utils::bounded_output(
+            Command::new("/bin/ps").args([
+                "-u",
+                String::from_utf8_lossy(&uid.stdout).trim(),
+                "-o",
+                "pid=,comm=",
+            ]),
+            Duration::from_secs(5),
+        ) else {
+            return;
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let line = line.trim();
+            let Some((pid, path)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let Ok(pid) = pid.parse::<u32>() else {
+                continue;
+            };
+            let name = std::path::Path::new(path.trim())
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if pid == std::process::id() || !is_window_name(name, own) {
+                continue;
+            }
+            let Some(args) = crate::utils::bounded_output(
+                Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "command="]),
+                Duration::from_secs(5),
+            ) else {
+                continue;
+            };
+            let args: Vec<_> = String::from_utf8_lossy(&args.stdout)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            if !is_service_args(&args) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
         }
     }
 }

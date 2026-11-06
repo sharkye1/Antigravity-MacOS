@@ -55,7 +55,9 @@ pub enum Outcome {
 /// Derived from `product.json` rather than hardcoded: the folder is named after
 /// `nameShort`, so a rebranded or renamed build still resolves correctly.
 pub fn ide_settings_path(install: &Path) -> Option<PathBuf> {
-    let product = install.join("resources").join("app").join("product.json");
+    let product = crate::resources_dir(install)
+        .join("app")
+        .join("product.json");
     let text = fs::read_to_string(product).ok()?;
     let name = Regex::new(r#""nameShort"\s*:\s*"([^"]+)""#)
         .ok()?
@@ -67,7 +69,9 @@ pub fn ide_settings_path(install: &Path) -> Option<PathBuf> {
     // the same VS Code layout underneath (`<root>/<nameShort>/User/settings.json`).
     #[cfg(target_os = "windows")]
     let root = PathBuf::from(std::env::var("APPDATA").ok()?);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let root = crate::macos::application_support();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let root = {
         // An empty XDG_CONFIG_HOME (elevation can pass it through blank) is "unset",
         // not a relative root - fall back to ~/.config in that case.
@@ -313,7 +317,7 @@ fn legacy_removals(https: Option<&str>, no_proxy: Option<&str>, url: &str) -> (b
 /// Value-scoped, unlike the blanket unset `remove_proxy` does: this runs on the
 /// patch path, where a `https_proxy` the user exported for themselves is none of
 /// our business.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
     use std::process::Command;
     let Ok(out) = Command::new("systemctl")
@@ -376,7 +380,7 @@ pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
 /// shell, every `curl`, every package manager through `127.0.0.1:53129`. The
 /// private name reaches the patched binaries and nothing else; rewriting the
 /// file in place is also what retires the old names on an upgrade.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
     use std::process::Command;
     let path = environment_d_path()?;
@@ -462,7 +466,7 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
 /// Only ever removes our own file (the path is ours by construction) and our own
 /// variable; the standard names an older build exported are unset by value, so a
 /// proxy the user set another way survives the revert.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn remove_proxy(url: &str, _ca_path: &str) -> Result<(), String> {
     use std::process::Command;
     if let Ok(path) = environment_d_path() {
@@ -558,7 +562,7 @@ pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
 /// `HTTPS_PROXY`/`https_proxy` as the systemd user manager holds it - what a
 /// `environment.d` drop-in or a `systemctl --user set-environment` leaves behind,
 /// and what every app launched from the desktop inherits.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn session_manager_proxy(ours: &str) -> Option<ForeignProxy> {
     use std::process::Command;
     let out = Command::new("systemctl")
@@ -643,7 +647,7 @@ fn profile_root() -> Option<PathBuf> {
     std::env::var("APPDATA").ok().map(PathBuf::from)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn profile_root() -> Option<PathBuf> {
     match std::env::var("XDG_CONFIG_HOME") {
         Ok(x) if !x.is_empty() => Some(PathBuf::from(x)),
@@ -785,7 +789,7 @@ fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
 /// the proxy carrier that needs it. Removal is a trivial success - there is
 /// nothing of ours in a persistent store to take out - while a request to *set*
 /// one is refused honestly rather than silently doing nothing.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
     match value {
         None => Ok(()),
@@ -808,7 +812,7 @@ fn current_env(name: &str) -> Option<String> {
 
 /// On Linux reads the process environment, the systemd user manager session,
 /// or the persistent environment.d drop-in.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn current_env(name: &str) -> Option<String> {
     if let Ok(v) = std::env::var(name) {
         let trimmed = v.trim().to_string();
@@ -859,7 +863,7 @@ fn current_cli_endpoint() -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn current_cli_endpoint() -> Option<String> {
     None
 }
@@ -877,6 +881,83 @@ pub fn proxy_env_value() -> Option<String> {
 pub fn proxy_env_is_ours() -> bool {
     let ours = crate::proxy::proxy_url();
     proxy_env_value().is_some_and(|v| is_our_proxy_value(&v, &ours))
+}
+
+#[cfg(target_os = "macos")]
+fn profile_root() -> Option<PathBuf> {
+    Some(crate::macos::application_support())
+}
+
+#[cfg(target_os = "macos")]
+fn current_env(name: &str) -> Option<String> {
+    crate::macos::session_env(name)
+}
+
+#[cfg(target_os = "macos")]
+fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
+    crate::macos::set_session_env(name, value)
+}
+
+#[cfg(target_os = "macos")]
+fn current_cli_endpoint() -> Option<String> {
+    current_env(CLI_ENV_VAR)
+}
+
+#[cfg(target_os = "macos")]
+fn session_manager_proxy(ours: &str) -> Option<ForeignProxy> {
+    for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
+        if let Some(value) = current_env(name).filter(|v| !is_ours_on_any_port(v, ours)) {
+            return Some(ForeignProxy {
+                value,
+                found_in: format!("{name} в сессии launchd"),
+            });
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
+    let mut removed = false;
+    for name in [
+        LEGACY_PROXY_ENV_VAR,
+        "https_proxy",
+        NO_PROXY_ENV_VAR,
+        "no_proxy",
+    ] {
+        if let Some(value) = current_env(name) {
+            let ours = if name.eq_ignore_ascii_case(NO_PROXY_ENV_VAR) {
+                removed && value == NO_PROXY_VALUE
+            } else {
+                is_ours_on_any_port(&value, url)
+            };
+            if ours {
+                set_env(name, None)?;
+                removed = true;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(target_os = "macos")]
+pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
+    let already = current_env(PROXY_ENV_VAR).as_deref() == Some(url)
+        && crate::macos::agent_path(crate::macos::ENV_LABEL).is_file();
+    let migrated = remove_legacy_proxy_env(url)?;
+    crate::macos::persist_proxy(url)?;
+    Ok(if already && !migrated {
+        Outcome::AlreadySet
+    } else {
+        Outcome::Applied
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
+    crate::macos::remove_proxy()?;
+    remove_legacy_proxy_env(url)?;
+    clear_node_ca(ca_path)
 }
 
 #[cfg(test)]

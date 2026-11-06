@@ -101,9 +101,19 @@ fn connect_pinned(addr: SocketAddr, timeout: Duration, if_index: u32) -> io::Res
     Ok(sock.into())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn connect_pinned(addr: SocketAddr, timeout: Duration, _if_index: u32) -> io::Result<TcpStream> {
     TcpStream::connect_timeout(&addr, timeout)
+}
+
+#[cfg(target_os = "macos")]
+fn connect_pinned(addr: SocketAddr, timeout: Duration, if_index: u32) -> io::Result<TcpStream> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    use std::os::fd::AsRawFd;
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    crate::macos::bind_interface(socket.as_raw_fd(), addr.is_ipv6(), if_index)?;
+    socket.connect_timeout(&SockAddr::from(addr), timeout)?;
+    Ok(socket.into())
 }
 
 /// The interface the routing table would send a packet to `dest` through.
@@ -120,9 +130,14 @@ pub fn best_interface(dest: Ipv4Addr) -> Option<u32> {
     (rc == 0 && idx != 0).then_some(idx)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn best_interface(_dest: Ipv4Addr) -> Option<u32> {
     None
+}
+
+#[cfg(target_os = "macos")]
+pub fn best_interface(dest: Ipv4Addr) -> Option<u32> {
+    crate::macos::interface_index(&crate::macos::route_interface(&dest.to_string())?)
 }
 
 #[cfg(target_os = "windows")]

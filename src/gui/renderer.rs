@@ -84,7 +84,13 @@ impl Kind {
             #[cfg(windows)]
             Kind::Warp => "DirectX 12 (программный)",
             #[cfg(not(windows))]
-            Kind::Wgpu => "Vulkan/GL",
+            Kind::Wgpu => {
+                if cfg!(target_os = "macos") {
+                    "Metal"
+                } else {
+                    "Vulkan/GL"
+                }
+            }
             Kind::Gl => "OpenGL",
         }
     }

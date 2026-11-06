@@ -42,8 +42,14 @@ use crate::upstream;
 
 /// Where the NRPT rules point. Any 127.0.0.0/8 address works; .53 keeps it
 /// recognisable and clear of anything bound to 127.0.0.1.
+#[cfg(not(target_os = "macos"))]
 pub const LISTEN_IP: &str = "127.0.0.53";
+#[cfg(target_os = "macos")]
+pub const LISTEN_IP: &str = "127.0.0.1";
+#[cfg(not(target_os = "macos"))]
 pub const LISTEN_PORT: u16 = 53;
+#[cfg(target_os = "macos")]
+pub const LISTEN_PORT: u16 = 53130;
 
 /// What generation of relay this build ships.
 ///
@@ -223,10 +229,15 @@ pub fn log_dir() -> PathBuf {
     PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("AGUnlocker")
 }
 
+#[cfg(target_os = "macos")]
+pub fn log_dir() -> PathBuf {
+    crate::macos::application_support().join("AGUnlocker")
+}
+
 /// On Linux the per-user state dir follows the XDG base-dir spec
 /// (`~/.local/share/agunlocker`), which is also where the own-proxy config and
 /// any relay log will live once that layer is ported.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn log_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .ok()
@@ -803,7 +814,12 @@ fn answer_log(hits: &[(std::path::PathBuf, ls_log::Tally)]) {
     // After the answers and refusals: an answer older than the drop must not
     // wipe the streak the drop is about to add to.
     if let Some(d) = drop {
-        on_drops(drops, d, dropped_host.as_deref(), answer.is_some_and(|a| a > d));
+        on_drops(
+            drops,
+            d,
+            dropped_host.as_deref(),
+            answer.is_some_and(|a| a > d),
+        );
     }
 }
 
@@ -1161,6 +1177,7 @@ pub fn run() -> Result<(), String> {
     });
     // The gate hosts' own door (`loopback`). If it cannot be bound the relay
     // keeps answering with substituted addresses, exactly as before.
+    #[cfg(not(target_os = "macos"))]
     thread::spawn(|| {
         if let Err(e) = loopback::run() {
             log_proxy(&format!("локальные адреса гейт-хостов не заняты: {}", e));
@@ -1177,6 +1194,8 @@ pub fn run() -> Result<(), String> {
 /// It maintains gate.json, the resolver pool, client log watching, and the
 /// proxy environment variable, then serves the local proxy on 127.0.0.1:53129.
 pub fn run_proxy_service() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return run();
     log_proxy("служба обхода (локальный прокси) запущена");
     record_version();
     gate::note_started();
@@ -1540,7 +1559,13 @@ mod tests {
         let ip: Ipv4Addr = LISTEN_IP.parse().expect("valid address");
         assert!(ip.is_loopback());
         // Not .1: something else on the machine may already own it.
+        #[cfg(not(target_os = "macos"))]
         assert_ne!(ip, Ipv4Addr::LOCALHOST);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            listen_addr(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 53130))
+        );
     }
 
     #[test]
