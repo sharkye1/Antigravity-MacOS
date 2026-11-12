@@ -52,11 +52,20 @@ const FALLBACK_PORTS: [u16; 6] = [43129, 44129, 45129, 46129, 47129, 48129];
 /// The port this process bound, 0 until it has (the relay's own answer).
 static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
-/// The file the relay records a moved port in, beside `settings.json` - the one
-/// place the window (another process, as the same user) and the relay agree on.
-/// Absent while the proxy is on `DEFAULT_PORT`.
+/// The file the relay records its bound port in, beside `settings.json` - the
+/// one place the window (another process, as the same user) and the relay agree
+/// on. On macOS it also distinguishes this service from an old process that
+/// happens to answer on the same default port.
 fn port_file() -> PathBuf {
     crate::dns_forwarder::log_dir().join("proxy_port")
+}
+
+/// The port the current relay successfully bound, as seen by the window.
+pub fn adopted_port() -> Option<u16> {
+    fs::read_to_string(port_file())
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
 }
 
 /// The port the local proxy listens on: the one this process bound, else the
@@ -80,7 +89,7 @@ fn adopt(port: u16) {
     if cfg!(test) {
         return;
     }
-    if port == DEFAULT_PORT {
+    if port == DEFAULT_PORT && !cfg!(target_os = "macos") {
         fs::remove_file(port_file()).ok();
     } else {
         let path = port_file();
@@ -88,6 +97,12 @@ fn adopt(port: u16) {
             fs::create_dir_all(dir).ok();
         }
         fs::write(path, port.to_string()).ok();
+    }
+}
+
+fn clear_adopted_port() {
+    if cfg!(target_os = "macos") {
+        fs::remove_file(port_file()).ok();
     }
 }
 
@@ -277,7 +292,11 @@ fn ours_answers(port: u16) -> bool {
         return crate::portcheck::listener_image(addr_at(port))
             .is_none_or(|n| names.contains(&n.to_ascii_lowercase()));
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        return adopted_port() == Some(port);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     true
 }
 
@@ -289,6 +308,11 @@ pub(crate) fn listen_addr() -> std::net::SocketAddr {
 
 fn addr_at(port: u16) -> std::net::SocketAddr {
     std::net::SocketAddr::from((LISTEN_IP.parse::<Ipv4Addr>().unwrap(), port))
+}
+
+/// Whether something accepts connections on a particular proxy port.
+pub fn listener_answers_on(port: u16) -> bool {
+    answers_at(addr_at(port))
 }
 
 /// Whether something accepts connections on the proxy's address right now.
@@ -1362,8 +1386,24 @@ fn bind_from(first: u16, fallbacks: &[u16]) -> Result<TcpListener, crate::gate::
         unreachable!("BIND_TRIES is not zero")
     };
     if cause.another_port_helps() {
+        #[cfg(target_os = "macos")]
+        let legacy_ag_may_be_running = crate::macos::legacy_proxy_binary_exists()
+            && matches!(&cause, crate::portcheck::Cause::Held(_));
         for other in fallbacks.iter().copied().filter(|p| *p != first) {
             if let Ok(listener) = TcpListener::bind(addr_at(other)) {
+                #[cfg(target_os = "macos")]
+                if legacy_ag_may_be_running {
+                    crate::dns_forwarder::log_proxy(&format!(
+                        "порт {} занят; найдена старая копия ag_proxy, возможно она ещё запущена. Новая служба перенесена на {}",
+                        first, other
+                    ));
+                } else {
+                    crate::dns_forwarder::log_proxy(&format!(
+                        "порт {} недоступен ({}) — локальный прокси перенесён на {}",
+                        first, err, other
+                    ));
+                }
+                #[cfg(not(target_os = "macos"))]
                 crate::dns_forwarder::log_proxy(&format!(
                     "порт {} недоступен ({}) — локальный прокси перенесён на {}",
                     first, err, other
@@ -1384,6 +1424,9 @@ pub const REBIND_EVERY: Duration = Duration::from_secs(60);
 /// Runs the proxy until the process ends. Never returns while the socket holds;
 /// while it cannot be had, says why (`gate::set_blocker`) and keeps trying.
 pub fn run(if_index: u32) -> Result<(), String> {
+    // A marker from an older relay cannot prove this instance owns the socket.
+    // It is written again only after this process successfully binds.
+    clear_adopted_port();
     let mut said: Option<crate::gate::Blocker> = None;
     let listener = loop {
         match bind_listener() {
@@ -1393,8 +1436,12 @@ pub fn run(if_index: u32) -> Result<(), String> {
                         "локальный прокси поднялся на порту {}",
                         port()
                     ));
-                    crate::gate::set_blocker("proxy", None);
                 }
+                crate::dns_forwarder::log_proxy(&format!(
+                    "локальный прокси запущен на порту {}",
+                    port()
+                ));
+                crate::gate::set_blocker("proxy", None);
                 break listener;
             }
             Err(blocker) => {

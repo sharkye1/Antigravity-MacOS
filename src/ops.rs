@@ -1427,13 +1427,55 @@ fn repair(ctx: &mut Ctx) {
     if with_dns {
         ctx.settings.dns = true;
     }
+    ctx.log(Level::Step, "Проверяю службу обхода и занятый порт.");
+    #[cfg(target_os = "macos")]
+    let legacy_ag_conflict = crate::macos::legacy_proxy_binary_exists()
+        && crate::proxy::listener_answers_on(crate::proxy::DEFAULT_PORT)
+        && (!background::is_running()
+            || crate::proxy::adopted_port() != Some(crate::proxy::DEFAULT_PORT));
+    #[cfg(not(target_os = "macos"))]
+    let legacy_ag_conflict = false;
+    if legacy_ag_conflict {
+        ctx.log(
+            Level::Warn,
+            "Порт 53129 занят, и найдена старая копия ag_proxy — похоже, старая служба ещё работает. Новая служба попробует перейти на свободный порт.",
+        );
+    }
+    ctx.log(Level::Step, "Перезапускаю службу обхода.");
     // `ensure_running` reinstalls only a copy that differs from this build;
     // a relay that is merely stopped or outdated needs the full `enable`.
     if let Err(e) = background::enable() {
         ctx.log(Level::Err, format!("Служба обхода не запустилась: {}", e));
         return;
     }
-    ctx.log(Level::Ok, "Служба обхода переустановлена и запущена.");
+    #[cfg(target_os = "macos")]
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !background::is_running() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if !background::is_running() {
+            ctx.log(
+                Level::Err,
+                "launchd принял запуск, но служба не перешла в состояние «работает». Подробности — в журнале службы.",
+            );
+            return;
+        }
+    }
+    ctx.log(Level::Ok, "Служба обхода запущена.");
+    if legacy_ag_conflict {
+        ctx.log(Level::Step, "Жду запуска нового прокси на свободном порту.");
+        match proxy::wait_for_our_listener(Duration::from_secs(20)) {
+            Some(port) => ctx.log(
+                Level::Ok,
+                format!("Старая служба обойдена: новый локальный прокси слушает порт {}.", port),
+            ),
+            None => ctx.log(
+                Level::Warn,
+                "Старая служба всё ещё может занимать порт. Новый прокси не подтвердил запуск; откройте журнал службы для подробностей.",
+            ),
+        }
+    }
     if with_dns {
         enable_dns(ctx);
     } else {

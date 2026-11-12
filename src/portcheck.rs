@@ -82,12 +82,12 @@ impl Cause {
     /// Whether moving to another port gets around it. Security software that
     /// refuses this program a socket refuses it every port.
     ///
-    /// Windows only. On Linux nothing would carry a moved port into the
-    /// `environment.d` drop-in (the relay's env thread is Windows'), so a move
-    /// would leave the variable naming the old port; there the proxy keeps
-    /// retrying its own port instead, which a borrowed ephemeral port frees.
+    /// Windows and macOS can carry a moved port into the client environment.
+    /// Linux has no environment drop-in, so a move would leave the variable
+    /// naming the old port; there the proxy keeps retrying its own port instead.
     pub fn another_port_helps(&self) -> bool {
-        cfg!(windows) && !matches!(self, Cause::Denied)
+        (cfg!(windows) && !matches!(self, Cause::Denied))
+            || (cfg!(target_os = "macos") && matches!(self, Cause::Held(_)))
     }
 }
 
@@ -103,6 +103,12 @@ pub fn diagnose_on(addr: SocketAddr, err: &std::io::Error, proto: Proto) -> Caus
     let port = addr.port();
     if let Some(pid) = listener_pid(addr, proto) {
         return Cause::Held(process_name(pid));
+    }
+    // Unix reports a bound socket as EADDRINUSE. We may not be able to name
+    // its owner (notably a root-owned launchd job on macOS), but it is still a
+    // held port, and macOS can move the proxy while updating AG_LS_PROXY.
+    if err.kind() == std::io::ErrorKind::AddrInUse {
+        return Cause::Held(None);
     }
     if excluded_ranges(proto)
         .iter()
@@ -379,6 +385,20 @@ fn excluded_ranges(_proto: Proto) -> Vec<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_in_use_is_a_held_port_even_when_the_owner_cannot_be_named() {
+        let addr = "127.0.0.1:53129".parse().unwrap();
+        let cause = diagnose_on(
+            addr,
+            &std::io::Error::from(std::io::ErrorKind::AddrInUse),
+            Proto::Tcp,
+        );
+        assert_eq!(cause, Cause::Held(None));
+        if cfg!(target_os = "macos") {
+            assert!(cause.another_port_helps());
+        }
+    }
 
     #[test]
     fn netsh_ranges_are_read_in_any_language_and_nothing_else_is() {

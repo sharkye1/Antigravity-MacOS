@@ -37,6 +37,20 @@ pub fn application_support() -> PathBuf {
     home().join("Library").join("Application Support")
 }
 
+/// Older releases installed a separate `ag_proxy` in one of these per-user
+/// locations. Its LaunchDaemon can outlive the GUI app and keep port 53129
+/// occupied, so the current relay uses this as a hint when diagnosing a bind
+/// conflict.
+pub fn legacy_proxy_binary_exists() -> bool {
+    let home = home();
+    [
+        home.join(".local/share/agunlocker/ag_proxy"),
+        home.join("Library/Application Support/agunlocker/ag_proxy"),
+    ]
+    .iter()
+    .any(|path| path.is_file())
+}
+
 /// The `Resources` directory of an install root, whichever case it is spelled
 /// in. A bundle has `Contents/Resources`; on the default case-insensitive APFS
 /// `resources` reaches it too, but a case-sensitive volume would not.
