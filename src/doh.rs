@@ -298,6 +298,33 @@ pub fn query(ep: &Endpoint, wire: &[u8], budget: Duration) -> Result<Vec<u8>, St
     answer
 }
 
+/// Use fresh, interface-bound sockets so a connection from the ordinary pool
+/// cannot carry a query for the explicit DNS-AI mode.
+#[cfg(target_os = "macos")]
+pub fn query_bound(ep: &Endpoint, wire: &[u8], budget: Duration, iface: &crate::netif::Iface) -> Result<Vec<u8>, String> {
+    let ips: Vec<IpAddr> = ep.addrs.iter().filter_map(|ip| ip.parse().ok()).filter(|ip: &IpAddr| {
+        match ip { IpAddr::V4(_) => !iface.v4.is_empty(), IpAddr::V6(_) => !iface.v6.is_empty() }
+    }).collect();
+    let until = Instant::now() + budget;
+    let path = format!("{}?dns={}", ep.path, base64url(wire));
+    let slice = budget / ips.len().max(1) as u32;
+    let start = NEXT_ADDR.fetch_add(1, Ordering::Relaxed);
+    let mut error = "DNS-AI недоступен на обычном интерфейсе".to_string();
+    for ix in walk(ips.len(), start) {
+        let now = Instant::now();
+        if now >= until { break; }
+        let deadline = (now + slice).min(until);
+        let response = Conn::open_with(ep, ips[ix], deadline, |addr, timeout| {
+            crate::net::connect_required(addr, timeout, iface)
+        }).and_then(|mut conn| conn.ask(&path, deadline).map_err(Fail::into_message));
+        match response {
+            Ok(answer) => return Ok(answer.body),
+            Err(err) => error = err,
+        }
+    }
+    Err(error)
+}
+
 /// `query` for an endpoint whose addresses are not compiled in: the user's own
 /// DoH server, whose name is resolved at run time. Same walk, same kept
 /// connections - the certificate still has to prove `ep.host`.
@@ -681,7 +708,18 @@ struct Conn {
 
 impl Conn {
     fn open(ep: &Endpoint, ip: IpAddr, deadline: Instant) -> Result<Conn, String> {
-        let (sock, tls) = handshake(ep, ip, deadline)?;
+        Self::open_with(ep, ip, deadline, |addr, timeout| {
+            crate::net::connect(addr, timeout, crate::net::pin_interface())
+        })
+    }
+
+    fn open_with(
+        ep: &Endpoint,
+        ip: IpAddr,
+        deadline: Instant,
+        dial: impl FnOnce(SocketAddr, Duration) -> std::io::Result<TcpStream>,
+    ) -> Result<Conn, String> {
+        let (sock, tls) = handshake(ep, ip, deadline, dial)?;
         let mut unsent = Vec::with_capacity(64);
         unsent.extend_from_slice(PREFACE);
         unsent.extend_from_slice(&frame(FRAME_SETTINGS, 0, 0, &[]));
@@ -749,21 +787,15 @@ fn handshake(
     ep: &Endpoint,
     ip: IpAddr,
     deadline: Instant,
+    dial: impl FnOnce(SocketAddr, Duration) -> std::io::Result<TcpStream>,
 ) -> Result<(TcpStream, ClientConnection), String> {
     let remaining = |d: Instant| d.saturating_duration_since(Instant::now());
     let budget = remaining(deadline);
     if budget.is_zero() {
         return Err(format!("{}: бюджет истёк до соединения", ip));
     }
-    // Pinned to the ISP link while a tunnel holds the default route (P13): a
-    // provider that substitutes only for Russian addresses answers a query that
-    // arrives from the tunnel's foreign exit with the genuine address.
-    let mut sock = crate::net::connect(
-        SocketAddr::new(ip, 443),
-        budget,
-        crate::net::pin_interface(),
-    )
-    .map_err(|_| format!("{}: нет соединения", ip))?;
+    let mut sock = dial(SocketAddr::new(ip, 443), budget)
+        .map_err(|err| format!("{ip}: нет соединения ({err})"))?;
     sock.set_nodelay(true).ok();
 
     let server = ServerName::try_from(ep.host.to_string())
@@ -1547,10 +1579,10 @@ mod tests {
             }
         }
         for &ip in &resuming {
-            let (_, conn) = handshake(ep, ip, Instant::now() + Duration::from_secs(8))
+            let conn = Conn::open(ep, ip, Instant::now() + Duration::from_secs(8))
                 .unwrap_or_else(|e| panic!("{}", e));
             assert_eq!(
-                conn.handshake_kind(),
+                conn.tls.handshake_kind(),
                 Some(HandshakeKind::Resumed),
                 "{}: полное рукопожатие — предъявлен чужой билет",
                 ip

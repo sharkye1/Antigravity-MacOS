@@ -1165,6 +1165,19 @@ pub fn attribute_tunnel(at: Instant, host: Option<&str>) -> Option<(Kind, u64)> 
         .map(|t| (t.kind, t.id))
 }
 
+/// Diagnostic attribution requires a named endpoint and agreement among all
+/// overlapping tunnels for it. The route selector can still use its heuristic.
+pub fn observed_answer_route(at: Instant, host: &str) -> Option<Kind> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let list = TUNNELS.lock().ok()?;
+    let mut matching = list.iter().filter(|t| {
+        t.host == host && t.opened <= at + ATTRIBUTION_SLACK
+            && t.closed.is_none_or(|closed| closed + ATTRIBUTION_SLACK >= at)
+    });
+    let kind = matching.next()?.kind;
+    matching.all(|t| t.kind == kind).then_some(kind)
+}
+
 /// Marks the tunnel a model answer came through. Closed tunnels are marked too:
 /// the log line is read seconds after the answer started, and a short answer is
 /// over by then - what matters is that the credit lands on the right record.

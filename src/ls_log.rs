@@ -395,33 +395,17 @@ fn count_needle(buf: &[u8], needle: &[u8]) -> usize {
 /// walks `%APPDATA%` and then the IDE's `logs` folder, which has one sub-folder
 /// per launch, and a window ticking every three seconds must not do that.
 pub fn candidate_logs() -> Vec<PathBuf> {
-    let Some(root) = profile_root() else {
-        return Vec::new();
-    };
-    let Ok(entries) = fs::read_dir(&root) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    let mut products = 0usize;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.to_ascii_lowercase().starts_with("antigravity") {
-            continue;
-        }
-        products += 1;
-        if products > MAX_PRODUCTS {
-            break;
-        }
-        let logs = entry.path().join("logs");
-        let desktop = logs.join("language_server.log");
-        if desktop.is_file() {
-            out.push(desktop);
-        }
-        if let Some(session) = newest_session(&logs) {
-            let ide = session.join("ls-main.log");
-            if ide.is_file() {
-                out.push(ide);
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        desktop_logs(&PathBuf::from(home).join("Library/Logs"), &mut out);
+    }
+    if let Some(root) = profile_root() {
+        for entry in product_dirs(&root) {
+            let logs = entry.path().join("logs");
+            push_log(logs.join("language_server.log"), &mut out);
+            if let Some(session) = newest_session(&logs) {
+                push_log(session.join("ls-main.log"), &mut out);
             }
         }
     }
@@ -431,6 +415,32 @@ pub fn candidate_logs() -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn product_dirs(root: &Path) -> impl Iterator<Item = fs::DirEntry> {
+    fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase().starts_with("antigravity"))
+        .take(MAX_PRODUCTS)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn desktop_logs(root: &Path, out: &mut Vec<PathBuf>) {
+    for entry in product_dirs(root) {
+        push_log(entry.path().join("language_server.log"), out);
+    }
+}
+
+fn push_log(path: PathBuf, out: &mut Vec<PathBuf>) {
+    if !path.is_file() {
+        return;
+    }
+    let path = fs::canonicalize(&path).unwrap_or(path);
+    if !out.contains(&path) {
+        out.push(path);
+    }
 }
 
 /// `~/.gemini/<dir>/log` folders the `agy` backend writes `cli-<stamp>.log` to.
@@ -566,6 +576,53 @@ pub struct History {
     /// `horizon`: the newest and how many. The report's 12 h line; `overloaded`
     /// is the ten-minute one the card is drawn from.
     pub server_errors: Option<Sighting>,
+    pub activity: Vec<ModelEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelOutcome {
+    Request,
+    Answer,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelEvent {
+    pub ago: Duration,
+    pub outcome: ModelOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelCounts {
+    pub requests: usize,
+    pub answers: usize,
+    pub errors: usize,
+}
+
+pub fn model_counts(events: &[ModelEvent], elapsed: Duration, window: Duration) -> ModelCounts {
+    let mut counts = ModelCounts::default();
+    for event in events.iter().filter(|event| event.ago.saturating_add(elapsed) <= window) {
+        counts.requests += 1;
+        match event.outcome {
+            ModelOutcome::Answer => counts.answers += 1,
+            ModelOutcome::Error => counts.errors += 1,
+            ModelOutcome::Request => {}
+        }
+    }
+    counts
+}
+
+fn model_outcome(line: &[u8], answered: bool) -> Option<ModelOutcome> {
+    if answered {
+        return Some(ModelOutcome::Answer);
+    }
+    if !contains_ci(line, ANSWER_CALL.as_bytes()) {
+        return None;
+    }
+    if contains_ci(line, b"request failed:") || contains_ci(line, b"Status: 4") || contains_ci(line, b"Status: 5") {
+        return Some(ModelOutcome::Error);
+    }
+    contains_ci(line, b"URL: https://").then_some(ModelOutcome::Request)
 }
 
 /// The newest 503 "no capacity" a client log carries, and for which model.
@@ -622,16 +679,20 @@ pub fn history(paths: &[PathBuf], recent: Duration, horizon: Duration) -> Histor
         for line in text.lines() {
             let refusals = count_refusals(line.as_bytes());
             let answered = is_answer(line.as_bytes());
+            let model = model_outcome(line.as_bytes(), answered);
             let overloaded = is_overload(line.as_bytes());
             let server_error = overloaded || contains_ci(line.as_bytes(), SERVER_500.as_bytes());
             let unauthorized = contains_ci(line.as_bytes(), UNAUTH_401.as_bytes());
-            if refusals == 0 && !answered && !server_error && !unauthorized {
+            if refusals == 0 && model.is_none() && !server_error && !unauthorized {
                 continue;
             }
             let Some(ago) = parse_stamp(line).and_then(|at| age_secs(at, now)) else {
                 continue;
             };
             let ago = Duration::from_secs(ago as u64);
+            if let Some(outcome) = model.filter(|_| ago <= recent) {
+                out.activity.push(ModelEvent { ago, outcome });
+            }
             if ago > horizon {
                 continue;
             }
@@ -1402,6 +1463,37 @@ API Error: {Reason:UNSUPPORTED_LOCATION}
             "последняя region-400 за сутки: {:?}",
             newest_refusal(&logs, Duration::from_secs(24 * 3600))
         );
+        let recent = Duration::from_secs(600);
+        println!("model activity: {:?}", model_counts(&history(&logs, recent, recent).activity, Duration::ZERO, recent));
+    }
+
+    #[test]
+    fn desktop_log_in_the_macos_logs_tree_is_found() {
+        let root = std::env::temp_dir().join(format!("ag-desktop-logs-{}", std::process::id()));
+        let expected = root.join("Antigravity/language_server.log");
+        fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        fs::write(&expected, b"glog").unwrap();
+        let mut logs = Vec::new();
+        desktop_logs(&root, &mut logs);
+        desktop_logs(&root, &mut logs);
+        assert_eq!(logs, [expected.canonicalize().unwrap()]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn activity_counts_model_attempts_without_inventing_answers() {
+        let start = b"URL: https://example.test/v1internal:streamGenerateContent";
+        let response = b"URL: https://example.test/v1internal:streamGenerateContent ResponseID: test";
+        let failure = b"request failed: Post https://example.test/v1internal:streamGenerateContent: EOF";
+        let unrelated = b"URL: https://example.test/loadCodeAssist Status: 403";
+        assert_eq!(model_outcome(unrelated, false), None);
+        let events: Vec<_> = [(&start[..], 30), (&response[..], 40), (&failure[..], 59)]
+            .into_iter().map(|(line, time)| ModelEvent {
+                ago: Duration::from_secs(time),
+                outcome: model_outcome(line, is_answer(line)).unwrap(),
+            }).collect();
+        assert_eq!(model_counts(&events, Duration::ZERO, Duration::from_secs(60)), ModelCounts { requests: 3, answers: 1, errors: 1 });
+        assert_eq!(model_counts(&events, Duration::from_secs(2), Duration::from_secs(60)), ModelCounts { requests: 2, answers: 1, errors: 0 });
     }
 
     /// The regression this parser was rewritten for: measured on the machine's

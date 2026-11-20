@@ -290,12 +290,6 @@ pub enum Event {
 
 /// UI → worker.
 pub enum Cmd {
-    /// The key was accepted and the main screen is up. Auto-patch may act from
-    /// here on, never before: the first scan runs under the licence screen, and
-    /// patching from there would hand the patch to anyone without a key.
-    Unlocked,
-    /// Store the licence key just accepted, so the next start skips the screen.
-    RememberLicense(String),
     /// Ask the system again where the client's traffic leaves.
     ///
     /// Its own command because it is the one measurement that goes stale on its
@@ -334,6 +328,8 @@ pub enum Cmd {
     /// Everything on, in the order that works: the patch, auto-patch, then the
     /// bypass. The one button a user who is not a programmer needs.
     EnableAll,
+    #[cfg(target_os = "macos")]
+    SwitchDesktopRoute(crate::macos::desktop_route::Mode),
     /// Puts the service back the way the switches say it should be: reinstalls
     /// the relay when it is missing, stopped or older than this build, rewrites
     /// the rules, restores the proxy variable.
@@ -470,30 +466,16 @@ fn run_worker(
     settle_decline(&mut ctx);
     startup_housekeeping(&mut ctx);
 
-    // The first snapshot is deep: the window opens on the licence screen, so
-    // reading the binaries costs the user nothing here and the main screen is
-    // already truthful when it appears.
+    // Read the installed binaries before deciding whether to auto-patch.
     push_status(&mut ctx, Scan::Deep);
+    if auto_patch_found(&mut ctx) {
+        push_status(&mut ctx, Scan::Deep);
+    }
+    ctx.busy(None);
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Stop => return,
-            Cmd::RememberLicense(key) => {
-                if ctx.settings.license_key != key {
-                    ctx.settings.license_key = key;
-                    ctx.settings.save();
-                }
-            }
-            Cmd::Unlocked => {
-                // The first snapshot was taken while the licence screen was up;
-                // a fresh one either way, deep when auto-patch just wrote.
-                if auto_patch_found(&mut ctx) {
-                    push_status(&mut ctx, Scan::Deep);
-                } else {
-                    push_status(&mut ctx, Scan::System);
-                }
-                ctx.busy(None);
-            }
             // Off the queue, not on it. The measurement drives PowerShell and
             // takes seconds; on the queue, a user flipping a switch in the
             // middle of one would watch it snap back until it finished — G42's
@@ -628,10 +610,26 @@ fn run_worker(
                 push_status(&mut ctx, Scan::Deep);
                 ctx.busy(None);
             }
+            #[cfg(target_os = "macos")]
+            Cmd::SwitchDesktopRoute(mode) => {
+                use crate::macos::desktop_route::{self, Mode};
+                ctx.busy(Some("Переключаю маршрут Antigravity Desktop"));
+                match desktop_route::switch(mode) {
+                    Ok(true) => ctx.log(Level::Ok, match mode {
+                        Mode::System => "Antigravity Desktop запущен с системной маршрутизацией.",
+                        Mode::DnsAi => "Antigravity Desktop запущен с прокси DNS-AI для адресов модели.",
+                    }),
+                    Ok(false) => ctx.log(Level::Info, "Переключение маршрута отменено."),
+                    Err(err) => ctx.log(Level::Err, err),
+                }
+                push_status(&mut ctx, Scan::System);
+                ctx.busy(None);
+            }
             Cmd::Repair => {
                 ctx.busy(Some("Чиню службу обхода"));
-                repair(&mut ctx);
-                ctx.settings.save();
+                if repair(&mut ctx) {
+                    ctx.settings.save();
+                }
                 push_status(&mut ctx, Scan::System);
                 ctx.busy(None);
             }
@@ -1413,13 +1411,28 @@ fn patch_is_on(ctx: &Ctx) -> bool {
 /// task's restart policy gave up on, a relay older than this build, an antivirus
 /// that ate the copy in `%ProgramData%` - and every one of those is fixed by
 /// installing it again and putting its rules and variable back.
-fn repair(ctx: &mut Ctx) {
+fn repair(ctx: &mut Ctx) -> bool {
     if cfg!(target_os = "windows") && !is_admin() {
         ctx.log(
             Level::Err,
             "Нужны права администратора. Нажмите «Перезапустить от имени администратора».",
         );
-        return;
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    match crate::macos::recovery::with_confirmation() {
+        Ok(crate::macos::recovery::Outcome::NotNeeded) => {}
+        Ok(crate::macos::recovery::Outcome::Recovered) => {
+            ctx.log(Level::Ok, "Старые системные службы Unlocker выгружены, права на настройки восстановлены.");
+        }
+        Ok(crate::macos::recovery::Outcome::Cancelled) => {
+            ctx.log(Level::Info, "Восстановление отменено.");
+            return false;
+        }
+        Err(err) => {
+            ctx.log(Level::Err, format!("Не удалось восстановить права и службы Unlocker: {err}"));
+            return false;
+        }
     }
     // DNS is put back only when it was wanted, or when nothing else is: a user
     // running just their own proxy must not get DNS rules from a repair.
@@ -1446,7 +1459,7 @@ fn repair(ctx: &mut Ctx) {
     // a relay that is merely stopped or outdated needs the full `enable`.
     if let Err(e) = background::enable() {
         ctx.log(Level::Err, format!("Служба обхода не запустилась: {}", e));
-        return;
+        return true;
     }
     #[cfg(target_os = "macos")]
     {
@@ -1459,7 +1472,7 @@ fn repair(ctx: &mut Ctx) {
                 Level::Err,
                 "launchd принял запуск, но служба не перешла в состояние «работает». Подробности — в журнале службы.",
             );
-            return;
+            return true;
         }
     }
     ctx.log(Level::Ok, "Служба обхода запущена.");
@@ -1481,6 +1494,11 @@ fn repair(ctx: &mut Ctx) {
     } else {
         ensure_route_carrier(ctx);
     }
+    #[cfg(target_os = "macos")]
+    if ctx.settings.auto_patch_wanted() && !crate::macos::agent_is_loaded(crate::macos::WATCHDOG_LABEL) {
+        set_watchdog(ctx, true);
+    }
+    true
 }
 
 // --- client patch ----------------------------------------------------------

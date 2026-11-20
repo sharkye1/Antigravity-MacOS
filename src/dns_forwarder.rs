@@ -167,7 +167,10 @@ pub const LISTEN_PORT: u16 = 53;
 /// 48 = the update watchdog closes the whole app (not just its server) to free a
 ///     locked language server and starts it again after the patch (G92). An older
 ///     one kills the server alone and the app gives up on it after three restarts.
-pub const RELAY_VERSION: u32 = 48;
+/// 49 = dns.malw.link is available as a built-in DoH provider.
+/// 50 = macOS Desktop log discovery and timestamped answer-route evidence.
+/// 51 = separate DNS-AI listener for macOS Desktop.
+pub const RELAY_VERSION: u32 = 51;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -1099,7 +1102,8 @@ fn on_answers(count: usize, at: Instant, host: Option<&str>) {
         held: 0,
         route: None,
     });
-    let label = carried.map_or("не наш", |(k, _)| k.label());
+    let observed = host.and_then(|host| routes::observed_answer_route(at, host));
+    let label = observed.map_or("не установлен", |kind| kind.label());
     let mut lines: Vec<(usize, &'static str)> = Vec::new();
     if let Ok(mut g) = LAST_LINE.lock() {
         // A change of route ends the old line first: what was held back came
@@ -1124,7 +1128,7 @@ fn on_answers(count: usize, at: Instant, host: Option<&str>) {
             held, route
         ));
     }
-    gate::record_answer(carried.map(|(k, _)| k.label()));
+    gate::record_answer(at, observed.map(|kind| kind.label()));
 }
 
 /// How long one refusal through a tunnel the relay stood down for keeps

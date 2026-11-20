@@ -20,6 +20,8 @@
 
 use std::ffi::CStr;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+#[cfg(target_os = "macos")]
+use std::net::Ipv6Addr;
 
 /// Any public address: only ever used for a route lookup, never contacted.
 const PROBE_DEST: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
@@ -29,6 +31,8 @@ pub struct Iface {
     pub name: String,
     pub index: u32,
     pub v4: Vec<Ipv4Addr>,
+    #[cfg(target_os = "macos")]
+    pub v6: Vec<Ipv6Addr>,
     pub flags: u32,
 }
 
@@ -72,6 +76,8 @@ pub fn interfaces() -> Vec<Iface> {
                     name,
                     index,
                     v4: Vec::new(),
+                    #[cfg(target_os = "macos")]
+                    v6: Vec::new(),
                     flags: ifa.ifa_flags as u32,
                 });
                 out.len() - 1
@@ -79,6 +85,12 @@ pub fn interfaces() -> Vec<Iface> {
         };
         if let Some(a) = v4 {
             out[pos].v4.push(a);
+        }
+        #[cfg(target_os = "macos")]
+        if !ifa.ifa_addr.is_null() && unsafe { (*ifa.ifa_addr).sa_family } as i32 == libc::AF_INET6 {
+            // SAFETY: AF_INET6 identifies a sockaddr_in6 in this getifaddrs entry.
+            let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+            out[pos].v6.push(Ipv6Addr::from(sin6.sin6_addr.s6_addr));
         }
     }
     // SAFETY: the list getifaddrs allocated, freed once.
@@ -248,6 +260,12 @@ pub fn egress() -> Option<(u32, bool)> {
         .as_ref()
         .is_some_and(|b| b.index != isp && is_tunnel(b));
     Some((isp, vpn))
+}
+
+#[cfg(target_os = "macos")]
+pub fn physical_egress() -> Option<Iface> {
+    let (index, _) = egress()?;
+    interfaces().into_iter().find(|iface| iface.index == index && !is_tunnel(iface))
 }
 
 #[cfg(test)]

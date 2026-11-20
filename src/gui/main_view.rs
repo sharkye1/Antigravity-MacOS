@@ -1,4 +1,4 @@
-//! The one screen the tool has once the key is in.
+//! The main window.
 //!
 //! Top to bottom, in the order a person who is not a programmer reads it:
 //!
@@ -22,6 +22,7 @@ use std::time::Duration;
 use super::status::{self, Action, Tone};
 use super::{theme, widgets, App, DONATE_URL, TELEGRAM_GROUP_URL};
 use crate::ops::{Cap, Cmd, Level, State};
+use crate::update::{ReleaseInfo, RELEASES_LATEST_URL};
 use crate::utils::mask_path;
 
 pub fn view(app: &mut App, ui: &mut egui::Ui) {
@@ -39,7 +40,7 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
             ..Default::default()
         }))
         .show_separator_line(true)
-        .show(ui, footer);
+        .show(ui, |ui| footer(ui, app.update.as_ref()));
 
     egui::CentralPanel::default()
         .frame(egui::Frame::new())
@@ -66,8 +67,6 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
 // ---------------------------------------------------------------------------
 
 fn header(app: &mut App, ui: &mut egui::Ui) {
-    app.update_banner(ui);
-
     // No product name and no version here: both are in the title bar already,
     // and repeating them costs a line of a window this narrow.
     if let Some(what) = &app.busy {
@@ -140,6 +139,9 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
             });
             ui.add_space(4.0);
             ui.label(egui::RichText::new(&h.detail).size(13.5).color(theme::TEXT));
+            for line in status::activity_lines(&app.gate) {
+                ui.label(egui::RichText::new(line).size(12.5).color(theme::MUTED));
+            }
             if let Some(action) = h.action {
                 ui.add_space(10.0);
                 if widgets::primary(ui, action.label(), !busy).clicked() {
@@ -420,6 +422,8 @@ fn advanced_card(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(6.0);
     widgets::card(ui, |ui| {
         network_facts(app, ui);
+        #[cfg(target_os = "macos")]
+        desktop_route_controls(app, ui);
         vpn_exclusion_button(app, ui);
         ui.add_space(10.0);
         ui.separator();
@@ -436,6 +440,26 @@ fn advanced_card(app: &mut App, ui: &mut egui::Ui) {
         cap_row(app, ui, Cap::OwnProxy);
         own_proxy_field(app, ui);
     });
+}
+
+#[cfg(target_os = "macos")]
+fn desktop_route_controls(app: &App, ui: &mut egui::Ui) {
+    use crate::macos::desktop_route::Mode;
+
+    ui.label(egui::RichText::new("Маршрут Antigravity Desktop").size(13.0).strong());
+    ui.add_space(4.0);
+    ui.add_enabled_ui(!app.is_busy(), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Системный VPN").clicked() {
+                app.worker.send(Cmd::SwitchDesktopRoute(Mode::System));
+            }
+            if ui.button("DNS-AI вне VPN").clicked() {
+                app.worker.send(Cmd::SwitchDesktopRoute(Mode::DnsAi));
+            }
+        });
+    });
+    widgets::hint(ui, "DNS-AI применяется к адресам модели. При смене маршрута открытый Desktop перезапускается после подтверждения.");
+    ui.add_space(8.0);
 }
 
 /// A small «i» that opens or closes the text kept under `key`. Returns whether
@@ -947,13 +971,24 @@ fn log_keys(app: &mut App, ui: &mut egui::Ui) {
 /// is the line people are meant to read, not a caption under something else.
 const FOOTER_TEXT: f32 = 13.0;
 
-fn footer(ui: &mut egui::Ui) {
+fn footer(ui: &mut egui::Ui, release: Option<&ReleaseInfo>) {
     // The strip was about twice as tall as its text. Two things made it so, and
     // the margin was the smaller one: a link is an *interactive* widget, so it
     // claims `interact_size.y` (26 px, sized for buttons) however short its text
     // is. Shrinking that here — and only here — is what actually halves the bar.
     ui.spacing_mut().interact_size.y = 18.0;
     ui.spacing_mut().item_spacing.y = 0.0;
+
+    if let Some(release) = release {
+        let label = format!("Доступна версия {}", release.display_version());
+        if ui
+            .link(egui::RichText::new(label).size(12.0).color(theme::MUTED))
+            .on_hover_text("Открыть страницу релизов")
+            .clicked()
+        {
+            crate::utils::open_url(RELEASES_LATEST_URL);
+        }
+    }
 
     // Built right-to-left, so it reads left-to-right on screen while staying
     // pinned to the right edge.

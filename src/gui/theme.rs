@@ -75,7 +75,7 @@ fn install_font(ctx: &egui::Context) {
 ///
 /// egui ships Ubuntu-Light and Hack as its default fonts and both carry the
 /// Cyrillic block, so a Russian UI renders even when `install_font` finds
-/// nothing — verified by running the licence screen, not assumed.
+/// nothing.
 pub fn apply(ctx: &egui::Context) {
     install_font(ctx);
 

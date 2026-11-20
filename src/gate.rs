@@ -120,11 +120,13 @@ pub const CUT_OFF_AFTER: Duration = Duration::from_secs(4 * 60);
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Proof {
-    /// When the relay noticed it.
+    /// Timestamp of the model response in the log.
     pub at: u64,
     /// The route credited with it, by label. Empty when no gate tunnel of ours
     /// was open around it - the client reached Google some other way.
     pub route: String,
+    /// Whether the relay found a single matching route for this response.
+    pub route_verified: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,11 +353,12 @@ pub fn record_episode(count: u32, acted: String, route: Option<&str>) {
 }
 
 /// Called when a model answer shows up in a client log.
-pub fn record_answer(route: Option<&str>) {
+pub fn record_answer(at: Instant, route: Option<&str>) {
     update(|r| {
         r.last_ok = Some(Proof {
-            at: now_unix(),
+            at: now_unix().saturating_sub(at.elapsed().as_secs()),
             route: route.unwrap_or_default().to_string(),
+            route_verified: route.is_some(),
         })
     });
 }
@@ -385,6 +388,9 @@ pub struct View {
     pub seen: Option<crate::ls_log::Sighting>,
     /// The newest model answer in the client's log, the same way.
     pub answered: Option<crate::ls_log::Sighting>,
+    pub activity: crate::ls_log::ModelCounts,
+    #[cfg(target_os = "macos")]
+    pub connections: Option<crate::macos::traffic::Snapshot>,
     /// The newest refusal over the same horizon as `answered`. `seen` stops at
     /// `RECENT`, and without this a refusal eleven minutes old that came *after*
     /// the last answer disappeared, and the answer before it turned the card
@@ -437,10 +443,8 @@ const GAP_AFTER_400: Duration = Duration::from_secs(15);
 const GAP_BUSY: Duration = Duration::from_secs(45);
 const GAP_IDLE: Duration = Duration::from_secs(5 * 60);
 
-/// How often the list of log files is rebuilt. Antigravity can be installed,
-/// started or updated while this window is open, and each of those changes the
-/// list — but none of them happens on a three-second scale.
-const RELIST_EVERY: Duration = Duration::from_secs(60);
+/// Pick up a newly created Desktop log promptly on macOS.
+const RELIST_EVERY: Duration = Duration::from_secs(if cfg!(target_os = "macos") { 9 } else { 60 });
 
 /// How often the window re-asks whether it reaches the internet, while the
 /// relay stays cut off.
@@ -482,6 +486,7 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
     // forward without reading the file again.
     let mut found: Option<(crate::ls_log::Sighting, Instant)> = None;
     let mut answered: Option<(crate::ls_log::Sighting, Instant)> = None;
+    let mut activity = (Vec::new(), Instant::now());
     let mut refused_long: Option<(crate::ls_log::Sighting, Instant)> = None;
     let mut verify: Option<(crate::ls_log::Verification, Instant)> = None;
     let mut overloaded: Option<(crate::ls_log::Overload, Instant)> = None;
@@ -502,7 +507,9 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
         std::thread::sleep(TICK);
 
         if listed.elapsed() >= RELIST_EVERY {
-            logs = crate::ls_log::candidate_logs();
+            let current = crate::ls_log::candidate_logs();
+            scan |= current != logs;
+            logs = current;
             listed = Instant::now();
         }
         // A log that has not grown cannot have gained a refusal, so the tail is
@@ -527,6 +534,7 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
             let at = Instant::now();
             found = h.refused_recent.map(|s| (s, at)).or(found);
             answered = h.answered.map(|s| (s, at)).or(answered);
+            activity = (h.activity, at);
             refused_long = h.refused.map(|s| (s, at)).or(refused_long);
             verify = h.verify.map(|v| (v, at)).or(verify);
             overloaded = h.overloaded.map(|o| (o, at)).or(overloaded);
@@ -547,6 +555,9 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
                 let ago = s.ago + at.elapsed();
                 (ago <= ANSWER_RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
             }),
+            activity: crate::ls_log::model_counts(&activity.0, activity.1.elapsed(), RECENT),
+            #[cfg(target_os = "macos")]
+            connections: crate::macos::traffic::snapshot(),
             refused_long: refused_long.and_then(|(s, at)| {
                 let ago = s.ago + at.elapsed();
                 (ago <= ANSWER_RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
@@ -629,7 +640,11 @@ fn worth_sending(fresh: &View, shown: &View) -> bool {
         (None, None) => false,
         _ => true,
     };
-    if relay_changed || fresh.net_ok != shown.net_ok {
+    #[cfg(target_os = "macos")]
+    if fresh.connections != shown.connections {
+        return true;
+    }
+    if relay_changed || fresh.net_ok != shown.net_ok || fresh.activity != shown.activity {
         return true;
     }
     let newer =
@@ -671,14 +686,7 @@ mod tests {
     fn only_a_change_is_worth_waking_the_window_for() {
         let shown = View {
             seen: seen(120, 2),
-            answered: None,
-            refused_long: None,
-            verify: None,
-            overloaded: None,
-            server_errors: None,
-            unauthorized: None,
-            relay: None,
-            net_ok: None,
+            ..View::default()
         };
         let older = View {
             seen: seen(123, 2),
@@ -772,15 +780,8 @@ mod tests {
         assert!(!base.same_state_as(&answered));
 
         let shown = View {
-            seen: None,
-            answered: None,
-            refused_long: None,
-            verify: None,
-            overloaded: None,
-            server_errors: None,
-            unauthorized: None,
             relay: Some(base),
-            net_ok: None,
+            ..View::default()
         };
         assert!(!worth_sending(
             &View {

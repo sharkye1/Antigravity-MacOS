@@ -195,19 +195,18 @@ impl Facts {
                     bypassed: e.bypassed,
                 })
         });
-        // The path of the last answer when the relay saw one recently - and then
-        // exactly that, empty included: an answer no tunnel of ours carried went
-        // around us, and naming the route we would have used instead would be a
-        // claim about traffic that never touched it. Otherwise the route in force.
-        let route = relay.and_then(|r| {
-            let recent_ok = r.last_ok.as_ref().filter(|ok| {
-                crate::gate::now_unix().saturating_sub(ok.at)
-                    <= crate::gate::ANSWER_RECENT.as_secs()
-            });
-            match recent_ok {
-                Some(ok) => (!ok.route.is_empty()).then(|| ok.route.clone()),
-                None => (!r.route.is_empty()).then(|| r.route.clone()),
+        let route = answer.and_then(|ago| {
+            #[cfg(target_os = "macos")]
+            if !gate.connections.is_some_and(|sockets| {
+                sockets.local_proxy > 0 && sockets.tunnel == 0
+                    && sockets.other_interface == 0 && sockets.unknown == 0
+            }) {
+                return None;
             }
+            let logged_at = crate::gate::now_unix().saturating_sub(ago.as_secs());
+            let proof = relay?.last_ok.as_ref()?;
+            (proof.route_verified && proof.at.abs_diff(logged_at) <= EPISODE_SLACK
+                && !proof.route.is_empty()).then(|| proof.route.clone())
         });
         Facts {
             admin: s.admin || !cfg!(target_os = "windows"),
@@ -240,6 +239,42 @@ impl Facts {
     }
 }
 
+pub fn activity_lines(view: &View) -> Vec<String> {
+    let mut lines = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        let connection_line = match view.connections {
+            Some(sockets) => {
+                let counts = [
+                    (sockets.tunnel, "через VPN"),
+                    (sockets.dns_ai, "через порт DNS-AI"),
+                    (sockets.local_proxy, "через прокси Unlocker"),
+                    (sockets.other_interface, "вне VPN"),
+                    (sockets.unknown, "маршрут неизвестен"),
+                ];
+                let parts: Vec<_> = counts.into_iter().filter(|(count, _)| *count > 0)
+                    .map(|(count, label)| format!("{label} {count}"))
+                    .collect();
+                if parts.is_empty() {
+                    "Активных сетевых соединений Antigravity сейчас не видно.".into()
+                } else {
+                    format!("Соединения Antigravity · {}", parts.join(" · "))
+                }
+            }
+            None => "Данные о соединениях Antigravity пока недоступны.".into(),
+        };
+        lines.push(connection_line);
+    }
+    if view.activity.requests > 0 {
+        let minutes = crate::gate::RECENT.as_secs() / 60;
+        lines.push(format!(
+            "Вызовы модели по журналу за {minutes} мин · запросы {} · ответы {} · ошибки {}",
+            view.activity.requests, view.activity.answers, view.activity.errors,
+        ));
+    }
+    lines
+}
+
 fn blocker(relay: Option<&crate::gate::Report>, what: &str) -> Option<crate::gate::Blocker> {
     relay?.blockers.iter().find(|b| b.what == what).cloned()
 }
@@ -247,10 +282,11 @@ fn blocker(relay: Option<&crate::gate::Report>, what: &str) -> Option<crate::gat
 /// A provider's name as it is shown: an acronym stays one, anything else gets
 /// one capital.
 pub fn provider_name(name: &str) -> String {
-    // The two the pool carries are written the way their owners write them.
+    // Preserve the providers' published names.
     match name {
         "dns-ai.ru" => return "DNS-AI.ru".to_string(),
         "eu.geohide.ru" => return "eu.GeoHide.ru".to_string(),
+        "dns.malw.link" => return name.to_string(),
         _ => {}
     }
     let lead: String = name.chars().take_while(|c| c.is_alphabetic()).collect();
@@ -664,8 +700,8 @@ pub fn headline(f: &Facts) -> Headline {
             .route
             .as_deref()
             .filter(|r| !r.is_empty())
-            .map(|r| format!(" · путь: {r}"))
-            .unwrap_or_default();
+            .map(|r| format!(" · маршрут ответа: {r}"))
+            .unwrap_or_else(|| " · маршрут ответа не установлен".into());
         return Headline {
             tone: Tone::Ok,
             title: "Работает".into(),

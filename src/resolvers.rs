@@ -323,10 +323,6 @@ pub struct Provider {
     pub transport: Transport,
 }
 
-/// Services that substitute Google/AI endpoints for clients they geolocate to a
-/// blocked region. All three were verified to answer over plain UDP:53 and to
-/// front a real SNI proxy (see kb/dns.md); their lists differ and change
-/// without notice, which is exactly why the choice is made per query.
 /// The provider names, in pool order, for the window's per-provider switches.
 ///
 /// Names only. The addresses stay where they are: a switch list is a new place
@@ -381,6 +377,12 @@ pub const PROVIDERS: &[Provider] = &[
         ],
         v6: &[],
         transport: Transport::Udp,
+    },
+    Provider {
+        name: "dns.malw.link",
+        v4: &[],
+        v6: &[],
+        transport: Transport::Doh(&DNS_MALW),
     },
     // Last on purpose: the user's own server(s). Not a provider at all until
     // they type one in: `provider_disabled` keeps it out of the race, the
@@ -443,6 +445,18 @@ pub static DNS_AI: crate::doh::Endpoint = crate::doh::Endpoint {
         "185.251.90.181",
         "2a00:b700:5::3:62",
         "2a12:5940:d4ef::219",
+    ],
+};
+
+// Bootstrap addresses published by the provider at https://info.dns.malw.link/.
+static DNS_MALW: crate::doh::Endpoint = crate::doh::Endpoint {
+    host: "dns.malw.link",
+    path: "/dns-query",
+    addrs: &[
+        "179.254.166.171",
+        "164.5.224.81",
+        "2a12:bec4:1bb0:27dd::2",
+        "2a13:82c0:0:d::3",
     ],
 };
 
@@ -1578,7 +1592,7 @@ fn resolve_through_tunnel(
 
 /// The provider to prefer for `name`, and how long a racer may be held for it.
 ///
-/// A DoH provider loses a fair race by construction: it pays a TLS handshake
+/// DNS-AI loses a fair race over DoH: it pays a TLS handshake
 /// where a UDP provider answers in one round trip, so listing it first in
 /// `PROVIDERS` buys nothing on its own. What is worth preferring is not the DNS
 /// latency but **the proxy the answer points at**, which is the number the IDE
@@ -1593,9 +1607,7 @@ fn preferred_provider(name: &str) -> Option<usize> {
     if !PREFERRED_NAMES.contains(&name.as_str()) {
         return None;
     }
-    PROVIDERS
-        .iter()
-        .position(|p| matches!(p.transport, Transport::Doh(_)))
+    PROVIDERS.iter().position(|p| p.name == LEAD_PROVIDER)
 }
 
 /// What a one-shot to `provider` needs at minimum, whatever the caller budgeted.
@@ -2380,6 +2392,19 @@ mod tests {
         for (i, p) in udp.iter().enumerate() {
             assert_eq!(fallback[i], p.v4[0]);
         }
+    }
+
+    #[test]
+    fn geohide_and_malw_are_separate_dns_providers() {
+        let geohide = PROVIDERS.iter().find(|p| p.name == "eu.geohide.ru").unwrap();
+        assert!(matches!(geohide.transport, Transport::Udp));
+
+        let malw = PROVIDERS.iter().find(|p| p.name == "dns.malw.link").unwrap();
+        let Transport::Doh(endpoint) = malw.transport else {
+            panic!("dns.malw.link must use DoH");
+        };
+        assert_eq!(endpoint.host, malw.name);
+        assert_eq!(endpoint.path, "/dns-query");
     }
 
     /// The invariant a DoH provider lives or dies by.

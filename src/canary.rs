@@ -121,8 +121,7 @@ pub fn about_banner() -> String {
 }
 
 /// Handles `--about` / `--license` / `--version` and exits. Called first thing
-/// in `main`, before the licence prompt, so a binary can always be fingerprinted
-/// without a key.
+/// in `main` so a binary can be fingerprinted from the command line.
 pub fn handle_cli_flags() {
     let wants = std::env::args().skip(1).any(|a| {
         matches!(

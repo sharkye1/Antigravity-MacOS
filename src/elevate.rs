@@ -172,13 +172,29 @@ fn elevated_output(exe: &Path, flag: &str, inst: &Path) -> std::io::Result<std::
 /// error -128, mapped to pkexec's 126.
 #[cfg(target_os = "macos")]
 fn elevated_output(exe: &Path, flag: &str, inst: &Path) -> std::io::Result<std::process::Output> {
-    use std::os::unix::process::ExitStatusExt;
     let cmd = format!(
         "{} {} {}",
         shell_quote(&exe.display().to_string()),
         flag,
         shell_quote(&inst.display().to_string())
     );
+    macos_admin_output(&cmd)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn recover_as_root(uid: u32) -> std::io::Result<std::process::Output> {
+    let exe = std::env::current_exe()?;
+    macos_admin_output(&format!(
+        "{} {} {uid}",
+        shell_quote(&exe.display().to_string()),
+        crate::macos::recovery::ROOT_FLAG,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_admin_output(cmd: &str) -> std::io::Result<std::process::Output> {
+    use std::os::unix::process::ExitStatusExt;
+
     let as_literal = cmd.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
         "do shell script \"{as_literal}\" with administrator privileges without altering line endings"

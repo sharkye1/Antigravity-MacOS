@@ -30,7 +30,6 @@ use ratatui::widgets::{
 };
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::auth;
 use crate::gate;
 use crate::gui::status::{self, Action, Facts, Tone};
 use crate::ops::{self, Cap, Cmd, Event, Level, State, Status, Worker};
@@ -87,9 +86,7 @@ pub fn run(note: Option<String>) -> Result<(), String> {
     }
 
     let mut terminal = ratatui::try_init().map_err(|e| format!("терминал недоступен: {e}"))?;
-    // Bracketed paste makes a pasted key one event instead of 25 keystrokes.
-    // Windows' console has no such mode; there a paste arrives as keys, which
-    // the key field takes just as well.
+    // Bracketed paste sends one event when a user pastes into an input field.
     #[cfg(not(windows))]
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
@@ -110,12 +107,6 @@ pub fn run(note: Option<String>) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-
-#[derive(PartialEq)]
-enum Screen {
-    License,
-    Main,
-}
 
 /// A line being typed into, drawn as a box over the list.
 enum Input {
@@ -146,11 +137,6 @@ enum Row {
 }
 
 struct App {
-    screen: Screen,
-    key: String,
-    key_error: bool,
-    key_next_attempt: Option<Instant>,
-
     update: Option<ReleaseInfo>,
     update_rx: Receiver<ReleaseInfo>,
 
@@ -205,17 +191,9 @@ impl App {
                 ));
             }
         }
-        let screen = first_screen(&crate::settings::Settings::load());
-        if screen == Screen::Main {
-            worker.send(Cmd::Unlocked);
-        }
         let mut list = ListState::default();
         list.select(Some(0));
         Self {
-            screen,
-            key: String::new(),
-            key_error: false,
-            key_next_attempt: None,
             update: None,
             update_rx,
             worker,
@@ -318,9 +296,7 @@ impl App {
             self.quit = true;
             return;
         }
-        if self.screen == Screen::License {
-            self.on_license_key(k, ctrl);
-        } else if self.input.is_some() {
+        if self.input.is_some() {
             self.on_input_key(k, ctrl);
         } else {
             self.on_main_key(k);
@@ -328,60 +304,13 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) {
-        let text = text.trim();
-        if self.screen == Screen::License {
-            self.key = text.to_string();
-            self.key_error = false;
-        } else if let Some(
+        if let Some(
             Input::Path { text: t, .. }
             | Input::OwnProxy { text: t }
             | Input::CustomDns { text: t },
         ) = &mut self.input
         {
-            t.push_str(text);
-        }
-    }
-
-    fn on_license_key(&mut self, k: KeyEvent, ctrl: bool) {
-        match k.code {
-            KeyCode::Esc => self.quit = true,
-            KeyCode::Enter => self.try_key(),
-            KeyCode::Backspace => {
-                self.key.pop();
-                self.key_error = false;
-            }
-            KeyCode::Char('u') if ctrl => self.key.clear(),
-            KeyCode::Char(c) if !ctrl && self.key.chars().count() < 64 => {
-                self.key.push(c);
-                self.key_error = false;
-            }
-            _ => {}
-        }
-    }
-
-    fn try_key(&mut self) {
-        let normalized = self
-            .key
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .count();
-        if normalized != 24 {
-            self.key_error = true;
-            return;
-        }
-        let now = Instant::now();
-        if self.key_next_attempt.is_some_and(|t| t > now) {
-            return;
-        }
-        if auth::verify_key(self.key.trim()) {
-            self.worker
-                .send(Cmd::RememberLicense(self.key.trim().to_string()));
-            self.screen = Screen::Main;
-            self.worker.send(Cmd::Unlocked);
-        } else {
-            self.key_error = true;
-            // The same brake the window has on a flood of guesses.
-            self.key_next_attempt = Some(now + Duration::from_millis(500));
+            t.push_str(text.trim());
         }
     }
 
@@ -951,10 +880,7 @@ impl App {
             );
             return;
         }
-        match self.screen {
-            Screen::License => self.draw_license(f, area),
-            Screen::Main => self.draw_main(f, area),
-        }
+        self.draw_main(f, area);
     }
 
     fn title_line(&self) -> Line<'static> {
@@ -975,71 +901,11 @@ impl App {
         Line::from(spans)
     }
 
-    fn draw_license(&mut self, f: &mut Frame, area: Rect) {
-        let block = Block::new()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(self.title_line());
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        let shown = if self.key.is_empty() {
-            Span::styled(
-                "XXXXXXXXXXXX-XXXXXXXXXXXX",
-                Style::new().fg(Color::DarkGray),
-            )
-        } else {
-            Span::raw(self.key.clone())
-        };
-        let mut lines = vec![
-            Line::raw(""),
-            Line::styled(
-                "Лицензионный ключ",
-                Style::new().add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(""),
-            Line::from(vec![
-                Span::raw("  › "),
-                shown,
-                Span::styled("▏", Style::new().fg(Color::Cyan)),
-            ]),
-            Line::raw(""),
-        ];
-        if self.key_error {
-            let normalized = self
-                .key
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .count();
-            let why = if normalized != 24 {
-                "В ключе 24 буквы и цифры (дефис не считается)."
-            } else {
-                "Ключ не подходит к этой версии анлокера."
-            };
-            lines.push(Line::styled(why, Style::new().fg(Color::Red)));
-            lines.push(Line::raw(""));
-        }
-        lines.push(Line::styled(
-            format!(
-                "Ключ можно взять в группе: {}",
-                crate::gui::TELEGRAM_KEYS_URL
-            ),
-            Style::new().fg(Color::Gray),
-        ));
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "Enter — продолжить · Ctrl+U — стереть · Esc — выход",
-            Style::new().fg(Color::DarkGray),
-        ));
-        f.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
-            inner.inner(ratatui::layout::Margin::new(2, 1)),
-        );
-    }
-
     fn draw_main(&mut self, f: &mut Frame, area: Rect) {
         let facts = self.facts();
         let headline = facts.as_ref().map(status::headline);
+        let activity = status::activity_lines(&self.gate);
+        let activity_h = activity.iter().map(|line| wrapped_height(line, area.width)).sum::<u16>();
 
         // The card's height follows its text, so a long detail is never cut.
         let inner_w = area.width.saturating_sub(4);
@@ -1048,10 +914,13 @@ impl App {
             None => 3,
         }
         .min(area.height / 3);
-        let log_h = if area.height >= 32 { 9 } else { 6 };
-        let [top, card, list, hint, journal, keys] = Layout::vertical([
+        let available = area.height.saturating_sub(card_h + 8);
+        let activity_h = activity_h.min(available.saturating_sub(3));
+        let log_h = (if area.height >= 32 { 9 } else { 6 }).min(available.saturating_sub(activity_h));
+        let [top, card, traffic, list, hint, journal, keys] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(card_h),
+            Constraint::Length(activity_h),
             Constraint::Min(4),
             Constraint::Length(2),
             Constraint::Length(log_h),
@@ -1061,6 +930,12 @@ impl App {
 
         f.render_widget(Paragraph::new(self.title_line()), top);
         self.draw_card(f, card, headline.as_ref());
+        if !activity.is_empty() {
+            f.render_widget(
+                Paragraph::new(activity.join("\n")).style(Style::new().fg(Color::Gray)).wrap(Wrap { trim: true }),
+                traffic,
+            );
+        }
 
         let rows = self.rows();
         let (at, _) = self.cursor(&rows);
@@ -1307,20 +1182,6 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
         })
         .sum::<usize>()
         .min(usize::from(u16::MAX)) as u16
-}
-
-/// The licence screen, always — except in a *debug* build started with
-/// `AG_UNLOCKER_DEV_SKIP_KEY`, as in the window.
-fn first_screen(settings: &crate::settings::Settings) -> Screen {
-    #[cfg(debug_assertions)]
-    if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
-        return Screen::Main;
-    }
-    // A key accepted before and still good for this version: no screen.
-    if auth::verify_key(&settings.license_key) {
-        return Screen::Main;
-    }
-    Screen::License
 }
 
 enum Copied {

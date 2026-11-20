@@ -781,7 +781,7 @@ impl InstallState {
 
 const INSPECT_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB stream buffer
 
-fn contains_subslice(data: &[u8], needle: &[u8]) -> bool {
+pub(crate) fn contains_subslice(data: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
     }

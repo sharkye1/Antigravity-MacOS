@@ -111,12 +111,37 @@ fn connect_pinned(addr: SocketAddr, timeout: Duration, if_index: u32) -> io::Res
 /// worked unpinned.
 #[cfg(not(target_os = "windows"))]
 fn connect_pinned(addr: SocketAddr, timeout: Duration, if_index: u32) -> io::Result<TcpStream> {
+    connect_bound(addr, timeout, if_index, true)
+}
+
+#[cfg(target_os = "macos")]
+pub fn connect_required(
+    addr: SocketAddr,
+    timeout: Duration,
+    interface: &crate::netif::Iface,
+) -> io::Result<TcpStream> {
+    if interface.index == 0 || crate::netif::is_tunnel(interface) {
+        return Err(io::Error::other("обычный сетевой интерфейс недоступен"));
+    }
+    let stream = connect_bound(addr, timeout, interface.index, false)?;
+    let same_interface = match stream.local_addr()?.ip().to_canonical() {
+        std::net::IpAddr::V4(ip) => interface.v4.contains(&ip),
+        std::net::IpAddr::V6(ip) => interface.v6.contains(&ip),
+    };
+    if !same_interface {
+        return Err(io::Error::other("соединение не вышло через выбранный интерфейс"));
+    }
+    Ok(stream)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn connect_bound(addr: SocketAddr, timeout: Duration, if_index: u32, allow_unpinned: bool) -> io::Result<TcpStream> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     if let Err(e) = bind_to_interface(&sock, addr.is_ipv6(), if_index) {
         // Only a refusal of the privilege falls back. Any other error (ENODEV:
         // the interface went away) is a connect this interface cannot carry.
-        if !refused_privilege(&e) {
+        if !allow_unpinned || !refused_privilege(&e) {
             return Err(e);
         }
         note_unpinned(&e);

@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod asar;
-mod auth;
 mod background;
 mod canary;
 mod dns;
@@ -668,12 +667,40 @@ fn main() {
         if let Some(i) = args.iter().position(|a| a == elevate::UNPATCH_ROOT_FLAG) {
             elevate::run_unpatch_helper(args.get(i + 1).cloned());
         }
+        #[cfg(target_os = "macos")]
+        if args.get(1).is_some_and(|a| a == macos::recovery::ROOT_FLAG) {
+            macos::recovery::run_root(args.get(2).map(String::as_str));
+        }
     }
 
     canary::handle_cli_flags();
 
+    #[cfg(target_os = "macos")]
+    let _instance = {
+        use std::io::IsTerminal;
+
+        // The interactive app manages launchd jobs in the logged-in user's
+        // session. The privileged helper modes have already been dispatched.
+        if utils::is_admin() {
+            eprintln!("Запустите Antigravity Unlocker от своего пользователя, без sudo.");
+            std::process::exit(1);
+        }
+        match instances::lock_macos(&macos::application_support().join("agunlocker")) {
+            Ok(instance) => instance,
+            Err(err) => {
+                if std::io::stderr().is_terminal() {
+                    eprintln!("{err}");
+                } else {
+                    utils::message_box("Antigravity Unlocker", &err);
+                }
+                std::process::exit(1);
+            }
+        }
+    };
+
     // A window of an older release left open would keep re-applying its own
     // state under this one.
+    #[cfg(not(target_os = "macos"))]
     instances::close_others();
 
     if tui::requested() {

@@ -1208,7 +1208,14 @@ fn try_builtin_exit(client: TcpStream, _host: &str, _port: u16) -> Result<(), Tc
     Err(client)
 }
 
-fn serve(mut client: TcpStream, _if_index: u32) {
+#[derive(Clone, Copy)]
+enum ListenerMode {
+    Normal,
+    #[cfg(target_os = "macos")]
+    DnsAi,
+}
+
+fn serve(mut client: TcpStream, _mode: ListenerMode) {
     client.set_read_timeout(Some(REQUEST_IDLE)).ok();
     let (host, port) = match read_connect(&mut client) {
         Request::Connect(host, port) => (host, port),
@@ -1238,6 +1245,11 @@ fn serve(mut client: TcpStream, _if_index: u32) {
     // one to the next costs the client nothing (I35), and a tunnel already
     // open keeps its route whatever the table says next.
     if port == 443 && is_gate_host(&host) {
+        #[cfg(target_os = "macos")]
+        if matches!(_mode, ListenerMode::DnsAi) {
+            serve_dns_ai(client, &host, port);
+            return;
+        }
         let _gate = routes::begin_gate_connection(&client, &host);
         serve_gate(client, &host, port);
         return;
@@ -1251,6 +1263,61 @@ fn serve(mut client: TcpStream, _if_index: u32) {
     // reached cert-free through the routes above; nothing here needs a CA.
     client.set_read_timeout(None).ok();
     tunnel(client, &host, port);
+}
+
+#[cfg(target_os = "macos")]
+pub const DNS_AI_PORT: u16 = 53139;
+
+#[cfg(target_os = "macos")]
+fn serve_dns_ai(mut client: TcpStream, host: &str, port: u16) {
+    match dns_ai_connection(host, port) {
+        Ok(upstream) => {
+            if client.write_all(RESP_ESTABLISHED).is_ok() {
+                crate::dns_forwarder::log_proxy(&format!("DNS-AI вне VPN -> {host}"));
+                splice(client, upstream);
+            }
+        }
+        Err(err) => {
+            crate::dns_forwarder::log_proxy(&format!("DNS-AI вне VPN: {err}"));
+            let _ = client.write_all(RESP_BAD_GATEWAY);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn dns_ai_connection(host: &str, port: u16) -> Result<TcpStream, String> {
+    let iface = crate::netif::physical_egress().ok_or("обычный сетевой интерфейс недоступен")?;
+    let query = crate::dns_client::build_query(host, 0);
+    let answer = crate::doh::query_bound(&crate::resolvers::DNS_AI, &query, Duration::from_secs(4), &iface)
+        .map_err(|err| format!("DNS-AI не ответил через {} ({err})", iface.name))?;
+    let addresses: Vec<_> = crate::dns_client::answer_addrs(&answer).into_iter().filter(|ip| {
+        matches!(ip, std::net::IpAddr::V4(v4) if !v4.is_private() && !v4.is_loopback()
+            && !v4.is_link_local() && !v4.is_multicast() && !v4.is_unspecified() && !v4.is_broadcast())
+    }).collect();
+    if addresses.is_empty() {
+        return Err("DNS-AI не вернул пригодных адресов".into());
+    }
+    let slice = DIRECT_OPEN_BUDGET / addresses.len() as u32;
+    let mut error = String::new();
+    for ip in addresses {
+        match crate::net::connect_required(std::net::SocketAddr::new(ip, port), slice, &iface) {
+            Ok(stream) => {
+                crate::net::note_reached();
+                return Ok(stream);
+            }
+            Err(err) => error = err.to_string(),
+        }
+    }
+    Err(format!("соединение через {} не открылось: {error}", iface.name))
+}
+
+#[cfg(target_os = "macos")]
+fn run_dns_ai_listener() -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr_at(DNS_AI_PORT))?;
+    for stream in listener.incoming().flatten() {
+        thread::spawn(move || serve(stream, ListenerMode::DnsAi));
+    }
+    Ok(())
 }
 
 /// The most one gate connection may spend walking routes that fail to open.
@@ -1423,7 +1490,7 @@ pub const REBIND_EVERY: Duration = Duration::from_secs(60);
 
 /// Runs the proxy until the process ends. Never returns while the socket holds;
 /// while it cannot be had, says why (`gate::set_blocker`) and keeps trying.
-pub fn run(if_index: u32) -> Result<(), String> {
+pub fn run(_if_index: u32) -> Result<(), String> {
     // A marker from an older relay cannot prove this instance owns the socket.
     // It is written again only after this process successfully binds.
     clear_adopted_port();
@@ -1472,13 +1539,19 @@ pub fn run(if_index: u32) -> Result<(), String> {
         }
     };
     PROXY_BOUND.store(true, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_os = "macos")]
+    thread::spawn(|| {
+        if let Err(err) = run_dns_ai_listener() {
+            crate::dns_forwarder::log_proxy(&format!("порт режима DNS-AI недоступен: {err}"));
+        }
+    });
     // Costs a loopback socket and nothing else: no key is generated, nothing is
     // put in a trust store, and a client that never points at this port never
     // notices it is here.
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        thread::spawn(move || serve(stream, if_index));
+        thread::spawn(move || serve(stream, ListenerMode::Normal));
     }
     Ok(())
 }
@@ -1486,6 +1559,19 @@ pub fn run(if_index: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "uses the public DNS-AI service and an unauthenticated TLS handshake"]
+    fn live_dns_ai_pinned_route_reaches_desktop_tls() {
+        const HOST: &str = "daily-cloudcode-pa.googleapis.com";
+        let mut socket = dns_ai_connection(HOST, 443).expect("DNS-AI bound connection");
+        socket.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_secs(4))).unwrap();
+        let name = rustls::pki_types::ServerName::try_from(HOST).unwrap();
+        let mut tls = rustls::ClientConnection::new(probe_config(), name).unwrap();
+        tls.complete_io(&mut socket).expect("valid TLS for the model endpoint");
+    }
 
     /// Live: what the direct route would dial for each gate host - on Linux the
     /// provider pool's substituted address, never the system resolver's Google.
@@ -1587,7 +1673,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         thread::spawn(move || {
             let (sock, _) = listener.accept().expect("accepted");
-            serve(sock, 0);
+            serve(sock, ListenerMode::Normal);
         });
 
         let mut client = TcpStream::connect(addr).expect("connected");

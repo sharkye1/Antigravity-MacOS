@@ -17,11 +17,7 @@ webpki-roots = "1"
 # Decrypts the relay credential baked in by build.rs (owner build only; the
 # private src/relay.rs is the only user).
 aes-gcm = "0.10"
-# Reading the clipboard (right-click on the licence field pastes into it). Not a
-# new dependency in any real sense: eframe's own clipboard support is arboard, so
-# the crate is already linked in - this only asks it a question egui does not
-# expose. `default-features = false` because the image half is eframe's business,
-# not ours; features unify, so the build is unchanged either way.
+# Text clipboard access for both interfaces. eframe already uses arboard.
 arboard = { version = "3.6", default-features = false }
 # The one socket `TcpStream` cannot build: IP_UNICAST_IF has to be set before
 # `connect`, and std creates and connects in one call. Pins the relay's own

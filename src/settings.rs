@@ -42,10 +42,8 @@ pub struct Settings {
     #[serde(default)]
     pub group_key: String,
 
-    /// The licence key this machine last had accepted. Kept so a restart or an
-    /// `_N` update starts straight on the main screen; a key for another 3-digit
-    /// version fails `auth::verify_key` and the licence screen comes back.
-    #[serde(default)]
+    /// Preserves the stored key for older builds sharing this settings file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub license_key: String,
 
     /// When the group code and the user's own proxy were last set (unix

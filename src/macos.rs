@@ -21,11 +21,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+pub mod desktop_route;
+pub mod recovery;
+pub mod traffic;
+
 /// Label prefix of every launchd job this tool owns.
 pub const LABEL_PREFIX: &str = "com.agunlocker";
 
 /// The job that re-sets the proxy variable at every login.
 pub const ENV_LABEL: &str = "com.agunlocker.env";
+pub const PROXY_LABEL: &str = "com.agunlocker.proxy";
+pub const WATCHDOG_LABEL: &str = "com.agunlocker.watchdog";
 
 pub fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())

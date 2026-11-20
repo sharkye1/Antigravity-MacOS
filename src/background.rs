@@ -865,9 +865,7 @@ mod unix_impl {
     // `~/Library/LaunchAgents/<label>.plist` existing is what "enabled" means.
 
     #[cfg(target_os = "macos")]
-    const PROXY_LABEL: &str = "com.agunlocker.proxy";
-    #[cfg(target_os = "macos")]
-    const WATCHDOG_LABEL: &str = "com.agunlocker.watchdog";
+    use crate::macos::{PROXY_LABEL, WATCHDOG_LABEL};
 
     /// The agent's plist: the installed copy with `flag`, kept alive, with the
     /// data dir the window reads (`log_dir()` follows `XDG_DATA_HOME`, which
